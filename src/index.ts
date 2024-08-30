@@ -1,8 +1,9 @@
 import { $, Context, Session, z } from 'koishi'
-import { Reactive } from 'koishi-plugin-w-reactive'
+import { type GuildMember } from '@satorijs/protocol'
+import { type Reactive } from 'koishi-plugin-w-reactive'
+import {} from 'koishi-plugin-w-option-conflict'
 import dedent from 'dedent'
 import dayjs from 'dayjs'
-import { GuildMember } from '@satorijs/protocol'
 
 export const name = 'w-repeat'
 
@@ -177,9 +178,10 @@ export function apply(ctx: Context, config: Config) {
     ctx.command('repeat.group', '查看群复读统计')
         .option('duration', '-d <duration> 指定时间范围，可以为 day / week / month / all', { type: /^day|week|month|all$/, fallback: 'day' })
         .option('page', '-p <page:posint> 查看分页', { fallback: 1 })
-        .option('list', '-l 显示复读消息列表', { fallback: true })
-        .option('list', '-L 不显示复读消息列表', { value: false })
+        .option('list', '-l 显示复读记录列表', { fallback: true })
+        .option('list', '-L 不显示复读记录列表', { value: false })
         .option('top', '-t <top:posint> 排行榜人数', { fallback: 1 })
+        .option('search', '-s <content:text> 根据查找复读记录')
         .action(async ({ session, options }) => {
             const { gid, guildId } = session
             if (! guildId) return '请在群内调用'
@@ -190,8 +192,11 @@ export function apply(ctx: Context, config: Config) {
                 .where({
                     gid,
                     startTime: duration === 'all'
-                        ? undefined
-                        : { $gte: + dayjs().startOf(duration) }
+                        ? {}
+                        : { $gte: + dayjs().startOf(duration) },
+                    content: options.search
+                        ? { $regex: new RegExp(options.search) }
+                        : {}
                 })
                 .orderBy(row => $.length(row.senders), 'desc')
                 .execute()
@@ -227,22 +232,27 @@ export function apply(ctx: Context, config: Config) {
             const { displayPageSize: pageSize, displayLength } = config
             const pageNum = Math.ceil(total / pageSize)
             const pageId = options.page
-            if (! Number.isInteger(pageId) || pageId < 1 || pageId > pageNum)
-                return `页数必须为 1 到 ${pageNum} 间的整数。`
+            if (pageId < 1 || pageId > pageNum) return `页数必须为 1 到 ${pageNum} 间的整数。`
 
-            return (options.list ? dedent`
-                本群${durationText}共有 ${ recs.length } 次复读，按复读次数排序依次为（第 ${pageId} / ${pageNum} 页）：
-                ${ recs
-                    .slice((pageId - 1) * pageSize, pageId * pageSize)
-                    .map((rec, i) => `${i + 1}. [${ ellipsis(rec.content, displayLength) } * ${rec.senders.length}] # ${rec.id}`)
-                    .join('\n')
-                }
-            ` + '\n\n' : '') +
-            dedent`   
-                ${ topText('参与复读', topRepeaters) }
-                ${ topText('发起复读', topStarters) }
-                ${ topText('打断复读', topInterrupters) }
-            `
+            return (options.list
+                ? dedent`
+                    本群${durationText}共有 ${ recs.length } 次${ options.search ? `符合 /${options.search}/ 的` : '' }复读
+                    按复读次数排序依次为：（第 ${pageId} / ${pageNum} 页）
+                    ${ recs
+                        .slice((pageId - 1) * pageSize, pageId * pageSize)
+                        .map((rec, i) => `${i + 1}. [${ ellipsis(rec.content, displayLength) } * ${rec.senders.length}] # ${rec.id}`)
+                        .join('\n')
+                    }
+                ` + '\n\n'
+                : ''
+            ) + (options.search
+                ? ''
+                : dedent`   
+                    ${ topText('参与复读', topRepeaters) }
+                    ${ topText('发起复读', topStarters) }
+                    ${ topText('打断复读', topInterrupters) }
+                `
+            )
         })
 
     ctx.command('repeat.show <id:posint>', '查看某次复读详情')
