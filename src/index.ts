@@ -1,4 +1,4 @@
-import { $, Context, Session, z } from 'koishi'
+import { $, Argv, Context, Direction, Field, Row, Session, z } from 'koishi'
 import { type GuildMember } from '@satorijs/protocol'
 import { type Reactive } from 'koishi-plugin-w-reactive'
 import {} from 'koishi-plugin-w-option-conflict'
@@ -51,7 +51,7 @@ export interface RepeatUser {
 }
 
 export function apply(ctx: Context, config: Config) {
-    const repeatFields = () => ({
+    const repeatFields = {
         id: 'unsigned',
         gid: 'string',
         content: 'string',
@@ -59,9 +59,9 @@ export function apply(ctx: Context, config: Config) {
         startTime: 'unsigned',
         endTime: 'unsigned',
         interrupter: 'string'
-    }) as const
-    ctx.model.extend('w-repeat-record', repeatFields(), { autoInc: true })
-    ctx.model.extend('w-repeat-runtime', repeatFields(), { autoInc: true })
+    } as const satisfies Field.Extension<RepeatRecord>
+    ctx.model.extend('w-repeat-record', { ...repeatFields }, { autoInc: true })
+    ctx.model.extend('w-repeat-runtime', { ...repeatFields }, { autoInc: true })
 
     const counterField = () => ({
         type: 'unsigned',
@@ -174,19 +174,42 @@ export function apply(ctx: Context, config: Config) {
 
     const getMemberName = (member: GuildMember) =>
         member.nick || member.name || member.user.name || member.user.id
+    
+    const requireList = (): Argv.OptionConfig => ({
+        conflictsWith: { option: 'list', value: false }
+    })
 
-    ctx.command('repeat.group', '查看群复读统计')
-        .option('duration', '-d <duration> 指定时间范围，可以为 day / week / month / all', { type: /^day|week|month|all$/, fallback: 'day' })
+    const reserveProjection = <S>(fields: Record<keyof S, any>): {
+        [K in keyof S]: (row: Row<S>) => Row<S>[K]
+    } => Object.fromEntries(Object
+        .keys(fields)
+        .map(name => [ name, (row: Row<S>) => row[name] ])
+    ) as any
+
+    ctx.command('repeat.stat', '查看群复读统计')
+        .alias('repeat.group')
+        .option('guild', '-g <guild:channel> 指定群（默认为本群）')
+        .option('duration', '-d <duration> 指定时间范围，可以为 day / week / month / all', {
+            type: /^(day|week|month|all)$/, fallback: 'day'
+        })
         .option('page', '-p <page:posint> 查看分页', { fallback: 1 })
         .option('list', '-l 显示复读记录列表', { fallback: true })
         .option('list', '-L 不显示复读记录列表', { value: false })
-        .option('top', '-t <top:posint> 排行榜人数', { fallback: 1 })
-        .option('search', '-s <content:text> 根据查找复读记录')
+        .option('top', '-t <top:natural> 排行榜人数', { fallback: 1 })
+        .option('filter', '-f <content:string> 根据查找复读记录', requireList())
+        // Todo: wait for array[index] query
+        // .option('starter', '-s [user:user] 根据发起者查找（默认为自己）', requireList())
+        // .option('repeater', '-r [user:user] 根据参与者查找（默认为自己）', requireList())
+        // .option('interrupter', '-i [user:user] 根据打断者查找（默认为自己）', requireList())
+        .option('sort', '-s <sortby> 指定排序方式', { type: /^(times|tps)?(:(desc|asc))?$/, fallback: 'times' })
         .action(async ({ session, options }) => {
-            const { gid, guildId } = session
-            if (! guildId) return '请在群内调用'
+            if (! session.guildId && ! options.guild) return '请在群内调用'
+            const gid = options.guild ?? session.gid
 
+            const { filter, top: topNum } = options 
             const duration = options.duration as 'day' | 'week' | 'month' | 'all'
+            const [ sortMethod = 'times', sortDirection = 'desc' ] = options.sort.split(':') as [ 'times' | 'tps', Direction ]
+
             const recs = await ctx.database
                 .select('w-repeat-record')
                 .where({
@@ -194,16 +217,35 @@ export function apply(ctx: Context, config: Config) {
                     startTime: duration === 'all'
                         ? {}
                         : { $gte: + dayjs().startOf(duration) },
-                    content: options.search
-                        ? { $regex: new RegExp(options.search) }
+                    content: filter
+                        ? { $regex: new RegExp(filter) }
                         : {}
                 })
-                .orderBy(row => $.length(row.senders), 'desc')
+                .project({
+                    ...reserveProjection<RepeatRecord>(repeatFields),
+                    times: row => $.length(row.senders)
+                })
+                .project({
+                    ...reserveProjection<RepeatRecord>(repeatFields),
+                    times: row => row.times,
+                    tps: row => $.mul($.div(row.times, $.sub(row.endTime, row.startTime)), 1000)
+                })
+                .orderBy(sortMethod, sortDirection)
                 .execute()
 
             const topInterrupters = countAndSortBy(recs, rec => rec.interrupter)
             const topStarters = countAndSortBy(recs, rec => rec.senders[0])
             const topRepeaters = countAndSortBy(recs, rec => rec.senders)
+
+            const memberDict = await getMemberDict(session)
+
+            const topText = (action: string, tops: [ string, number ][]) =>  dedent`
+                ${action}最多的${ topNum > 1 ? ` ${topNum} 名群友` : '' }是：${ tops
+                    .slice(0, topNum)
+                    .map(([ uid, count ]) => `[${ getMemberName(memberDict[uid]) } * ${count}]`)
+                    .join(', ')
+                }
+            `
 
             const { [duration]: durationText } = {
                 'all': '',
@@ -211,23 +253,20 @@ export function apply(ctx: Context, config: Config) {
                 'week': '这周',
                 'month': '当月'
             } satisfies Record<typeof duration, string>
-
-            const memberDict = await getMemberDict(session)
-
-            const topText = (action: string, tops: [ string, number ][]) => {
-                const topNum = options.top
-                return dedent`
-                    ${action}最多的${ topNum > 1 ? ` ${topNum} 名群友` : '' }是：${
-                        tops
-                            .slice(0, topNum)
-                            .map(([ uid, count ]) => `[${ getMemberName(memberDict[uid]) } * ${count}]`)
-                            .join(', ')
-                    }
-                `
-            }
+            const { [sortMethod]: sortMethodText } = {
+                'times': '复读次数',
+                'tps': '每秒复读次数'
+            } satisfies Record<typeof sortMethod, string>
+            const { [sortDirection]: sortDirectionText } = {
+                'desc': '降序',
+                'asc': '升序'
+            } satisfies Record<Direction, string>
 
             const total = recs.length
-            if (! total) return `本群${durationText}还没有复读。在？为什么不复读？`
+            const groupText = options.guild
+                ? (await session.bot.getGuild(gid.split(':')[1])).name
+                : '本群'
+            if (! total) return `${groupText}${durationText}还没有复读。在？为什么不复读？`
 
             const { displayPageSize: pageSize, displayLength } = config
             const pageNum = Math.ceil(total / pageSize)
@@ -236,16 +275,21 @@ export function apply(ctx: Context, config: Config) {
 
             return (options.list
                 ? dedent`
-                    本群${durationText}共有 ${ recs.length } 次${ options.search ? `符合 /${options.search}/ 的` : '' }复读
-                    按复读次数排序依次为：（第 ${pageId} / ${pageNum} 页）
+                    ${groupText}${durationText}共有 ${ recs.length } 次${ options.filter ? `符合 /${options.filter}/ 的` : '' }复读
+                    按${sortMethodText}${sortDirectionText}排序依次为：（第 ${pageId} / ${pageNum} 页）
                     ${ recs
                         .slice((pageId - 1) * pageSize, pageId * pageSize)
-                        .map((rec, i) => `${i + 1}. [${ ellipsis(rec.content, displayLength) } * ${rec.senders.length}] # ${rec.id}`)
+                        .map((rec, i) => {
+                            const content = ellipsis(rec.content, displayLength)
+                            const times = ` * ${rec.senders.length}`
+                            const extra = sortMethod === 'tps' ? `, ${rec.tps.toFixed(2)}/s` : ''
+                            return `${i + 1}. [${content}${times}${extra}] # ${rec.id}`
+                        })
                         .join('\n')
                     }
                 ` + '\n\n'
                 : ''
-            ) + (options.search
+            ) + (filter || topNum === 0
                 ? ''
                 : dedent`   
                     ${ topText('参与复读', topRepeaters) }
