@@ -1,13 +1,19 @@
-import { $, Argv, Context, Direction, Field, Row, Session, z } from 'koishi'
+import { $, h, Argv, Context, Direction, Field, Row, Session, z } from 'koishi'
 import { type GuildMember } from '@satorijs/protocol'
+
 import { type Reactive } from 'koishi-plugin-w-reactive'
 import {} from 'koishi-plugin-w-option-conflict'
+import {} from 'koishi-plugin-w-echarts'
+
 import dedent from 'dedent'
 import dayjs from 'dayjs'
 
 export const name = 'w-repeat'
 
-export const inject = [ 'database', 'reactive' ]
+export const inject = {
+    required: [ 'database', 'reactive' ],
+    optional: [ 'echarts' ]
+}
 
 export interface Config {
     repeatTime?: number
@@ -76,8 +82,47 @@ export function apply(ctx: Context, config: Config) {
         interruptTime: counterField()
     }, { primary: 'uid' })
 
-    const runtimes: Record<string, Reactive<RepeatRuntime>> = {}
+    const ellipsis = (text: string, maxLength: number) => text.length < maxLength
+        ? text
+        : text.slice(0, maxLength - 3) + '...'
 
+    const maybeArray = <T>(x: T | T[]): T[] => Array.isArray(x) ? x : [ x ]
+
+    const countBy = <T extends {}, K extends keyof any>(xs: T[], key: (x: T) => K | K[]) =>
+        xs.reduce<Record<keyof any, number>>((dict, x) => {
+            maybeArray(key(x)).forEach(k => {
+                dict[k] ??= 0
+                dict[k] ++
+            })
+            return dict
+        }, {})
+
+    const countAndSortBy = <T extends {}, K extends keyof any>(xs: T[], key: (x: T) => K | K[]) =>
+        Object.entries(countBy(xs, key)).sort(([, count1 ], [, count2]) => count2 - count1)
+
+    const getMemberDict = async (session: Session, guildId: string) => {
+        const { data: memberList } = await session.bot.getGuildMemberList(guildId)
+        return memberList.reduce<Record<string, GuildMember>>((dict, member) => {
+            dict[session.platform + ':' + member.user.id] = member
+            return dict
+        }, {})
+    }
+
+    const getMemberName = (member: GuildMember) =>
+        member.nick || member.name || member.user.name || member.user.id
+    
+    const requireList = (): Argv.OptionConfig => ({
+        conflictsWith: { option: 'list', value: false }
+    })
+
+    const reserveProjection = <S>(fields: Record<keyof S, any>): {
+        [K in keyof S]: (row: Row<S>) => Row<S>[K]
+    } => Object.fromEntries(Object
+        .keys(fields)
+        .map(name => [ name, (row: Row<S>) => row[name] ])
+    ) as any
+
+    const runtimes: Record<string, Reactive<RepeatRuntime>> = {}
     ctx.middleware(async (session, next) => {
         const { content, gid, uid } = session
         if (! session.guildId) return next()
@@ -146,48 +191,8 @@ export function apply(ctx: Context, config: Config) {
             `
         })
 
-    const ellipsis = (text: string, maxLength: number) => text.length < maxLength
-        ? text
-        : text.slice(0, maxLength - 3) + '...'
-
-    const maybeArray = <T>(x: T | T[]): T[] => Array.isArray(x) ? x : [ x ]
-
-    const countBy = <T extends {}, K extends keyof any>(xs: T[], key: (x: T) => K | K[]) =>
-        xs.reduce<Record<keyof any, number>>((dict, x) => {
-            maybeArray(key(x)).forEach(k => {
-                dict[k] ??= 0
-                dict[k] ++
-            })
-            return dict
-        }, {})
-
-    const countAndSortBy = <T extends {}, K extends keyof any>(xs: T[], key: (x: T) => K | K[]) =>
-        Object.entries(countBy(xs, key)).sort(([, count1 ], [, count2]) => count2 - count1)
-
-    const getMemberDict = async (session: Session, guildId = session.guildId) => {
-        const { data: memberList } = await session.bot.getGuildMemberList(guildId)
-        return memberList.reduce<Record<string, GuildMember>>((dict, member) => {
-            dict[session.platform + ':' + member.user.id] = member
-            return dict
-        }, {})
-    }
-
-    const getMemberName = (member: GuildMember) =>
-        member.nick || member.name || member.user.name || member.user.id
-    
-    const requireList = (): Argv.OptionConfig => ({
-        conflictsWith: { option: 'list', value: false }
-    })
-
-    const reserveProjection = <S>(fields: Record<keyof S, any>): {
-        [K in keyof S]: (row: Row<S>) => Row<S>[K]
-    } => Object.fromEntries(Object
-        .keys(fields)
-        .map(name => [ name, (row: Row<S>) => row[name] ])
-    ) as any
-
     ctx.command('repeat.stat', '查看群复读统计')
-        .alias('repeat.group')
+        .alias('repeat.guild')
         .option('guild', '-g <guild:channel> 指定群（默认为本群）')
         .option('duration', '-d <duration> 指定时间范围，可以为 day / week / month / all', {
             type: /^(day|week|month|all)$/, fallback: 'day'
@@ -205,6 +210,7 @@ export function apply(ctx: Context, config: Config) {
         .action(async ({ session, options }) => {
             if (! session.guildId && ! options.guild) return '请在群内调用'
             const gid = options.guild ?? session.gid
+            const [, guildId ] = gid.split(':')
 
             const { filter, top: topNum } = options 
             const duration = options.duration as 'day' | 'week' | 'month' | 'all'
@@ -237,7 +243,7 @@ export function apply(ctx: Context, config: Config) {
             const topStarters = countAndSortBy(recs, rec => rec.senders[0])
             const topRepeaters = countAndSortBy(recs, rec => rec.senders)
 
-            const memberDict = await getMemberDict(session)
+            const memberDict = await getMemberDict(session, guildId)
 
             const topText = (action: string, tops: [ string, number ][]) =>  dedent`
                 ${action}最多的${ topNum > 1 ? ` ${topNum} 名群友` : '' }是：${ tops
@@ -299,7 +305,165 @@ export function apply(ctx: Context, config: Config) {
             )
         })
 
+    ctx.command('repeat.graph.flow', '查看群复读流向图')
+        .option('guild', '-g <guild:channel> 指定群（默认为本群）')
+        .option('duration', '-d <duration> 指定时间范围，可以为 day / week / month / all', {
+            type: /^(day|week|month|all)$/, fallback: 'day'
+        })
+        .action(async ({ session, options }) => {
+            if (! ctx.echarts) return '此指令需要 echarts 服务'
+
+            if (! session.guildId && ! options.guild) return '请在群内调用'
+            const gid = options.guild ?? session.gid
+            const [, guildId ] = gid.split(':')
+
+            const memberDict = await getMemberDict(session, guildId)
+
+            const duration = options.duration as 'day' | 'week' | 'month' | 'all'
+
+            const starters: Record<string, { name: string, count: number }> = {}
+            const sendMat: Record<string, Record<string, { count: number }>> = {}
+            const recs = await ctx.database
+                .select('w-repeat-record')
+                .where({
+                    gid,
+                    startTime: duration === 'all'
+                        ? {}
+                        : { $gte: + dayjs().startOf(duration) }
+                })
+                .execute()
+
+            recs.forEach(rec => {
+                const starter = rec.senders[0]
+                ; (starters[starter] ??= {
+                    name: getMemberName(memberDict[starter]),
+                    count: 0
+                }).count ++
+                rec.senders.slice(1).forEach(sender => {
+                    ((sendMat[sender] ??= {})[starter] ??= { count: 0 }).count ++
+                })
+            })
+
+            type GraphSeriesOption = echarts.RegisteredSeriesOption['graph']
+
+            // Todo: normalization
+
+            const CATEGORY_NUM = 6
+            const eh = ctx.echarts.createChart(800, 800, {
+                series: {
+                    type: 'graph',
+                    layout: 'circular',
+                    circular: {
+                        rotateLabel: true
+                    },
+                    emphasis: {
+                        focus: 'adjacency'
+                    },
+                    categories: Array.from({ length: CATEGORY_NUM }).map((_, i) => ({ name: String(i) })),
+                    data: Object
+                        .entries(starters)
+                        .map<GraphSeriesOption['data'][number]>(([ uid, { name, count } ], i) => ({
+                            name: uid,
+                            label: {
+                                show: true,
+                                formatter: name,
+                                color: '#000',
+                                borderColor: 'transparent',
+                                shadowColor: 'transparent',
+                                fontSize: 22
+                            },
+                            symbolSize: count * 4,
+                            category: String(i % CATEGORY_NUM)
+                        })),
+                    links: Object
+                        .entries(sendMat)
+                        .flatMap(([ source, targetRow ]) => (
+                            Object.entries(targetRow).map<GraphSeriesOption['links'][number]>(([ target, { count } ]) => ({
+                                source,
+                                target,
+                                lineStyle: {
+                                    width: count * 2,
+                                    curveness: 0.2,
+                                    type: 'solid',
+                                    color: 'source'
+                                }
+                            }))
+                        ))
+                },
+                backgroundColor: '#fff'
+            })
+
+            return eh.export(3000)
+        })
+
+    ctx.command('repeat.graph.time', '查看群复读时段图')
+        .option('guild', '-g <guild:channel> 指定群（默认为本群）')
+        .action(async ({ session, options }) => {
+            if (! ctx.echarts) return '此指令需要 echarts 服务'
+
+            if (! session.guildId && ! options.guild) return '请在群内调用'
+            const gid = options.guild ?? session.gid
+            const [, guildId ] = gid.split(':')
+
+            // Todo: optimize
+            const recs = await ctx.database
+                .select('w-repeat-record')
+                .project([ 'startTime' ])
+                .execute()
+
+            const timeMat: Record<string, Record<string, number>> = Object.fromEntries(
+                Array.from({ length: 24 }).map((_, i) => [
+                    i,
+                    Object.fromEntries(Array.from({ length: 7 }).map((_, j) => [ j, 0 ]))
+                ])
+            )
+
+            recs.forEach(({ startTime }) => {
+                const time = dayjs(startTime)
+                const day = time.day()
+                const hour = time.hour()
+                timeMat[hour][day] ++
+            })
+
+            const data = Object
+                .entries(timeMat)
+                .flatMap(([ hour, dayRow ]) => Object
+                    .entries(dayRow)
+                    .map(([ day, count ]) => [ + hour, + day, count ])
+                )
+
+            const eh = ctx.echarts.createChart(24 * 30 + 100, 7 * 30 + 120, {
+                xAxis: {
+                    type: 'category',
+                    data: Array.from({ length: 24 }).map((_, i) => `0${i}`.slice(-2)),
+                    splitArea: { show: true }
+                },
+                yAxis: {
+                    type: 'category',
+                    data: [ 'Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat' ],
+                    splitArea: { show: true }
+                },
+                visualMap: {
+                    min: 0,
+                    max: Math.max(...data.map(it => it[2])),
+                    calculable: true,
+                    orient: 'horizontal',
+                    left: 'center',
+                    bottom: '10'
+                },
+                series: {
+                    type: 'heatmap',
+                    silent: true,
+                    label: { show: true },
+                    data
+                }
+            })
+
+            return eh.export()
+        })
+
     ctx.command('repeat.show <id:posint>', '查看某次复读详情')
+        .option('guild', '-g <guild:channel> 指定群（默认为本群）')
         .action(async ({ session }, id) => {
             const [ rec ] = await ctx.database.get('w-repeat-record', { id })
             if (! rec) return `未找到复读 #${id}。`
