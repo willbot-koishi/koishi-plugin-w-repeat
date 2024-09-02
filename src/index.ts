@@ -19,19 +19,21 @@ export interface Config {
     repeatTime?: number
     displayLength?: number
     displayPageSize?: number
+    doWrite?: boolean
 }
 
 export const Config: z<Config> = z.object({
     repeatTime: z.number().min(0).default(0).description('机器人复读需要的次数，0 为不复读'),
     displayLength: z.number().min(0).default(25).description('复读消息最大长度，超过则显示为省略号'),
-    displayPageSize: z.number().min(5).default(10).description('复读消息分页大小，至少为 5')
+    displayPageSize: z.number().min(5).default(10).description('复读消息分页大小，至少为 5'),
+    doWrite: z.boolean().default(true).description('是否向数据库写入复读数据')
 })
 
 declare module 'koishi' {
     interface Tables {
-        'w-repeat-record': RepeatRecord
-        'w-repeat-runtime': RepeatRuntime
-        'w-repeat-user': RepeatUser
+        'w-repeat-record': RepeatRecord         // 复读记录表
+        'w-repeat-runtime': RepeatRuntime       // 复读运行时（正在进行的复读）表
+        'w-repeat-user': RepeatUser             // 复读用户表
     }
 }
 
@@ -57,6 +59,8 @@ export interface RepeatUser {
 }
 
 export function apply(ctx: Context, config: Config) {
+    // 扩展数据库模型
+
     const repeatFields = {
         id: 'unsigned',
         gid: 'string',
@@ -81,6 +85,8 @@ export function apply(ctx: Context, config: Config) {
         beRepeatedCount: counterField(),
         interruptTime: counterField()
     }, { primary: 'uid' })
+
+    // 工具函数
 
     const ellipsis = (text: string, maxLength: number) => text.length < maxLength
         ? text
@@ -122,39 +128,56 @@ export function apply(ctx: Context, config: Config) {
         .map(name => [ name, (row: Row<S>) => row[name] ])
     ) as any
 
+    const $inc = (expr: $.Expr) => $.add(expr, 1)
+
+    // 复读中间件
+
     const runtimes: Record<string, Reactive<RepeatRuntime>> = {}
     ctx.middleware(async (session, next) => {
+        // 配置为不写入则跳过
+        if (! config.doWrite) return next()
+
+        // 只处理群内消息
         const { content, gid, uid } = session
         if (! session.guildId) return next()
 
+        // 不处理机器人指令
         if ((ctx.root.config.prefix as string[]).some(pre => content.startsWith(pre))) return next()
 
+        // 获取本群复读运行时，若无则创建
         const { reactive: runtime, patch } = runtimes[gid]
             ??= await ctx.reactive.create('w-repeat-runtime', { gid }, { gid })
 
-        const $inc = (expr: $.Expr) => $.add(expr, 1)
-
+        // 一次性写入运行时变化
         await patch(async (raw) => {
+            // 如果运行时中还不存在消息，或者记录的消息与当前消息不同
             if (! raw.content || raw.content !== content) {
+                // 如果运行时中的消息有不止一位发送者，即已经构成复读
                 if (raw.content && raw.senders.length > 1) {
+                    // 记录打断者和复读结束时间，并将运行时作为新复读记录写入复读记录表
                     raw.interrupter = uid
                     raw.endTime = Date.now()
                     ctx.database.create('w-repeat-record', raw)
+                    // 更新打断者复读用户数据
                     await ctx.database.upsert('w-repeat-user', row => [ {
                         uid,
                         interruptTime: $inc(row.interruptTime)
                     } ])
                 }
 
+                // 更新运行时的消息、开始时间和发送者
                 raw.content = content
                 raw.startTime = Date.now()
                 raw.senders = []
             }
 
+            // 将当前用户加入运行时的发送者列表中
             raw.senders.push(uid)
         })
 
+        // 如果发生了复读
         if (runtime.senders.length > 1) await Promise.all([
+            // 更新当前用户的复读数据
             ctx.database.upsert('w-repeat-user', row => [ {
                 uid,
                 repeatCount: $inc(row.repeatTime),
@@ -162,6 +185,7 @@ export function apply(ctx: Context, config: Config) {
                     ? undefined
                     : $inc(row.repeatTime)
             } ]),
+            // 更新复读发起者的复读数据
             ctx.database.upsert('w-repeat-user', row => [ {
                 uid: runtime.senders[0],
                 beRepeatedCount: $inc(row.beRepeatedCount),
@@ -171,12 +195,15 @@ export function apply(ctx: Context, config: Config) {
             } ])
         ])
 
+        // 如果复读次数达到配置，机器人参与复读
         if (runtime.senders.length === config.repeatTime) {
             return session.content
         }
 
         return next()
     }, true)
+
+    // 复读指令
 
     ctx.command('repeat.me', '查看我的复读统计')
         .action(async ({ session: { uid } }) => {
@@ -252,7 +279,6 @@ export function apply(ctx: Context, config: Config) {
                     .join(', ')
                 }
             `
-
             const { [duration]: durationText } = {
                 'all': '',
                 'day': '今日',
@@ -355,9 +381,6 @@ export function apply(ctx: Context, config: Config) {
                     layout: 'circular',
                     circular: {
                         rotateLabel: true
-                    },
-                    emphasis: {
-                        focus: 'adjacency'
                     },
                     categories: Array.from({ length: CATEGORY_NUM }).map((_, i) => ({ name: String(i) })),
                     data: Object
