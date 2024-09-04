@@ -152,10 +152,11 @@ export function apply(ctx: Context, config: Config) {
     const $inc = (expr: $.Expr) => $.add(expr, 1)
 
     const isSameImages = (images1: string[], images2: string[]): boolean => {
-        return images1.every((b1, i) => {
-            const b2 = images2[i]
-            return b1 === b2
-        })
+        return images1.length === images2.length
+            && images1.every((b1, i) => {
+                const b2 = images2[i]
+                return b1 === b2
+            })
     }
 
     // 复读中间件
@@ -206,9 +207,9 @@ export function apply(ctx: Context, config: Config) {
         let repeatCount = 0
         await patch(async (raw) => {
             // 如果运行时中还不存在消息，或者记录的消息与当前消息不同
-            if (! raw.content || raw.content !== content) {
+            if (! raw.content || raw.content !== content || ! isSameImages(images, raw.images)) {
                 // 如果运行时中的消息有不止一位发送者，即已经构成复读
-                if (raw.content && raw.senders.length > 1 && isSameImages(images, raw.images)) {
+                if (raw.content && raw.senders.length > 1) {
                     // 记录打断者和复读结束时间，并将运行时作为新复读记录写入复读记录表
                     raw.interrupter = uid
                     raw.endTime = Date.now()
@@ -580,7 +581,6 @@ export function apply(ctx: Context, config: Config) {
                 })
             }
             
-
             return dedent`
                 复读 #${id} 详情
                 群：${guild.name}${ guildId === session.guildId ? '（本群）' : '' }
