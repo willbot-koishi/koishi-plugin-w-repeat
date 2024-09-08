@@ -8,6 +8,6 @@ WillBot: Advanced repeating functions
 
 - [x] Repetition of images
   - [ ] Fuzzy
+- [x] Suspension and resumption of repetition (A A A B A A B A A A ...)
 - [ ] Infer real repetition starter (\*A B A A A ...)
-- [ ] Suspension and resumption of repetition (A A A B A A B A A A ...)
-- [ ] Repetition with sliced source (ABC B B B ...)
+  - [ ] Repetition with sliced source (ABC B B B ...)

@@ -1,7 +1,7 @@
 {
   "name": "koishi-plugin-w-repeat",
   "description": "WillBot: Advanced repeating functions",
-  "version": "0.6.2",
+  "version": "0.7.0",
   "main": "lib/index.js",
   "typings": "lib/index.d.ts",
   "files": [
@@ -38,5 +38,10 @@
   },
   "devDependencies": {
     "koishi-plugin-w-option-conflict": "^0.1.0"
+  },
+  "scripts": {
+    "build": "yarn workspace willbot build w-repeat",
+    "bump": "yarn workspace willbot bump w-repeat",
+    "pub": "yarn workspace willbot pub w-repeat"
   }
 }
