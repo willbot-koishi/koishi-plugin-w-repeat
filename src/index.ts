@@ -143,6 +143,9 @@ export function apply(ctx: Context, config: Config) {
     const pick = <T extends {}, K extends keyof T>(x: T, keys: K[]): Pick<T, K> =>
         Object.fromEntries(Object.entries(x).filter(([ k ]) => keys.includes(k as any))) as any
 
+    const omit = <T extends {}, K extends keyof T>(x: T, keys: K[]): Omit<T, K> =>
+        Object.fromEntries(Object.entries(x).filter(([ k ]) => ! keys.includes(k as any))) as any
+
     const pickOr = <T extends {}, K extends keyof T>(x: T, keys: K[]): [ Pick<T, K>, Omit<T, K> ] => {
         const xPick = {} as Pick<T, K>
         const xOmit = {} as Omit<T, K>
@@ -271,7 +274,7 @@ export function apply(ctx: Context, config: Config) {
                     await ctx.database.remove('w-repeat-record', resumed.id)
                     raw.suspended = undefined
                     // 将恢复的复读设为当前复读
-                    raw.current = current = resumed
+                    raw.current = current = omit(resumed, [ 'id' ])
                 }
             }
 
