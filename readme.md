@@ -11,3 +11,5 @@ WillBot: Advanced repeating functions
 - [x] Suspension and resumption of repetition (A A A B A A B A A A ...)
 - [ ] Infer real repetition starter (\*A B A A A ...)
   - [ ] Repetition with sliced source (ABC B B B ...)
+- [ ] Better graph
+  - [ ] Data normalization for flow graph

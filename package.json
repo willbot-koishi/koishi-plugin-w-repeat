@@ -1,7 +1,7 @@
 {
   "name": "koishi-plugin-w-repeat",
   "description": "WillBot: Advanced repeating functions",
-  "version": "0.7.1",
+  "version": "0.7.2",
   "main": "lib/index.js",
   "typings": "lib/index.d.ts",
   "files": [
@@ -15,14 +15,12 @@
     "plugin"
   ],
   "peerDependencies": {
-    "koishi": "4.17.11",
+    "koishi": "^4.17.11",
     "koishi-plugin-w-option-conflict": "^0.1.0"
   },
   "dependencies": {
-    "@satorijs/protocol": "^1.4.2",
     "dayjs": "^1.11.13",
     "dedent": "^1.5.3",
-    "koishi-plugin-w-echarts": "workspace:^",
     "pretty-format": "^29.7.0"
   },
   "koishi": {
@@ -37,6 +35,8 @@
     }
   },
   "devDependencies": {
+    "@satorijs/protocol": "^1.4.2",
+    "koishi-plugin-w-echarts": "workspace:^",
     "koishi-plugin-w-option-conflict": "^0.1.0"
   },
   "scripts": {

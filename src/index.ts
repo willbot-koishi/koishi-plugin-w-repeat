@@ -1,4 +1,4 @@
-import { $, h, Argv, Context, Direction, Field, Row, Session, z } from 'koishi'
+import { $, h, Argv, Context, Direction, Row, Session, z } from 'koishi'
 import { type GuildMember } from '@satorijs/protocol'
 
 import {} from '@koishijs/plugin-help'
@@ -431,13 +431,13 @@ export function apply(ctx: Context, config: Config) {
 
             const memberDict = await getMemberDict(session, guildId)
 
-            const topText = (action: string, tops: [ string, number ][]) =>  dedent`
+            const topText = (action: string, tops: [ string, number ][]) => dedent`
                 ${action}最多的${ topNum > 1 ? ` ${topNum} 名群友` : '' }是：${ tops
                     .slice(0, topNum)
                     .map(([ uid, count ]) => `[${ getMemberName(memberDict[uid]) } * ${count}]`)
                     .join(', ')
                 }
-            `
+            ` + (topNum >= 3 ? '\n' : '')
             const { [duration]: durationText } = {
                 'all': '',
                 'day': '今日',
