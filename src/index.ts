@@ -1,4 +1,4 @@
-import { $, h, Argv, Context, Direction, Row, Session, z } from 'koishi'
+import { $, h, Argv, Context, Direction, Row, Session, z, Query, Tables, SessionError } from 'koishi'
 import { type GuildMember } from '@satorijs/protocol'
 
 import {} from '@koishijs/plugin-help'
@@ -136,6 +136,8 @@ export function apply(ctx: Context, config: Config) {
             return dict
         }, {})
 
+    const elem = <T, U extends T>(x: T, xs: U[]): x is U => xs.includes(x as any)
+
     const countAndSortBy = <T extends {}, K extends keyof any>(xs: T[], key: (x: T) => K | K[]) =>
         Object.entries(countBy(xs, key)).sort(([, count1 ], [, count2]) => count2 - count1)
 
@@ -174,6 +176,32 @@ export function apply(ctx: Context, config: Config) {
     const getReserveProjection = <S>(fields: (keyof S)[]): {
         [K in keyof S]: (row: Row<S>) => Row<S>[K]
     } => Object.fromEntries(fields.map(name => [ name, (row: Row<S>) => row[name] ])) as any
+
+    const parseDuration = (duration: string): Query<RepeatRecord> & object => {
+        if (duration === 'all') return {}
+        else if (elem(duration, [ 'hour', 'day', 'week', 'month' ] as const))
+            return {
+                startTime: { $gte: + dayjs().startOf(duration) }
+            }
+        else if (duration.includes('~')) {
+            const [ start, end ] = duration
+                .split('~')
+                .map(str => {
+                    str = str.trim()
+                    if (! str) return undefined
+
+                    const date = dayjs(str)
+                    if (! date.isValid()) throw new SessionError(`'${str}' 不是有效的时间`)
+                    return date
+                })
+            return {
+                startTime: start ? { $gte: + start } : {},
+                endTime: end ? { $lte: + end } : {}
+            }
+        }
+        throw new SessionError(`'${duration}' 不是有效的时间范围`)
+    }
+
     const $inc = (expr: $.Expr) => $.add(expr, 1)
 
     // Stream
@@ -373,9 +401,10 @@ export function apply(ctx: Context, config: Config) {
         .alias('repeat.s')
         .alias('repeat.guild')
         .option('guild', '-g <guild:channel> 指定群（默认为本群）')
-        .option('duration', '-d <duration> 指定时间范围，可以为 day / week / month / all', {
-            type: /^(day|week|month|all)$/, fallback: 'day'
-        })
+        .option('duration',
+            '-d <duration:string> 指定时间范围。可以为 hour/day/week/month/all，或者用波浪号（~）分割的开始、结束时间',
+            { fallback: 'day' }
+        )
         .option('page', '-p <page:posint> 查看分页', { fallback: 1 })
         .option('list', '-l 显示复读记录列表', { fallback: true })
         .option('list', '-L 不显示复读记录列表', { value: false })
@@ -391,8 +420,7 @@ export function apply(ctx: Context, config: Config) {
             const gid = options.guild ?? session.gid
             const [, guildId ] = gid.split(':')
 
-            const { filter, top: topNum } = options 
-            const duration = options.duration as 'day' | 'week' | 'month' | 'all'
+            const { filter, top: topNum, duration } = options 
             const [ sortMethod = 'count', sortDirection = 'desc' ] = options.sort.split(':') as [
                 'count' | 'tps' | 'startTime', Direction
             ]
@@ -406,12 +434,10 @@ export function apply(ctx: Context, config: Config) {
                 .select('w-repeat-record')
                 .where({
                     gid,
-                    startTime: duration === 'all'
-                        ? {}
-                        : { $gte: + dayjs().startOf(duration) },
+                    ...parseDuration(duration),
                     content: filter
                         ? { $regex: new RegExp(filter) }
-                        : {}
+                        : {},
                 })
                 .project({
                     ...reserveProjection,
@@ -438,12 +464,14 @@ export function apply(ctx: Context, config: Config) {
                     .join(', ')
                 }
             ` + (topNum >= 3 ? '\n' : '')
-            const { [duration]: durationText } = {
+            const durationText = {
                 'all': '',
+                '~': '',
+                'hour': '最近一小时',
                 'day': '今日',
-                'week': '这周',
-                'month': '当月'
-            } satisfies Record<typeof duration, string>
+                'week': '本周',
+                'month': '本月'
+            }[duration] ?? `在 ${duration} `
             const { [sortMethod]: sortMethodText } = {
                 'count': '复读次数',
                 'tps': '每秒复读次数',
