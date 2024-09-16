@@ -31,6 +31,7 @@ export interface Config {
     displayPageSize: number
     repeatBlacklist: string[]
     doProcessImage: boolean
+    doOcr: boolean
     ocrLangs: string[]
     doWrite: boolean
 }
@@ -43,6 +44,7 @@ export const Config: z<Config> = z.object({
     displayPageSize: z.natural().min(5).default(10).description('复读消息分页大小，至少为 5'),
     repeatBlacklist: z.array(z.string()).description('复读内容黑名单'),
     doProcessImage: z.boolean().default(false).description('是否处理图片（会使用较多数据库空间）'),
+    doOcr: z.boolean().default(true).description('是否自动识别复读消息图片中文字'),
     ocrLangs: z.array(z.string()).default([ 'chi_sim', 'eng' ]).description('识别图片中文字时尝试的语言，参考 ' +
         '<https://tesseract-ocr.github.io/tessdoc/Data-Files#data-files-for-version-400-november-29-2016>'
     ),
@@ -441,7 +443,7 @@ export async function apply(ctx: Context, config: Config) {
                         interruptTime: $inc(row.interruptTime)
                     }]),
                     // 识别图片中文字
-                    (config.doProcessImage && ctx.tesseract) ? updateImageText(currentRec) : undefined
+                    (config.doProcessImage && config.doOcr && ctx.tesseract) ? updateImageText(currentRec) : undefined
                 ])
 
                 // 如果允许挂起，挂起被打断的复读
@@ -825,7 +827,7 @@ export async function apply(ctx: Context, config: Config) {
 
                 if (options.ocr) {
                     if (ctx.tesseract) await updateImageText(rec)
-                    return 'tesseract 服务未加载，无法识别图片中文字'
+                    else return 'tesseract 服务未加载，无法识别图片中文字'
                 }
             }
 
