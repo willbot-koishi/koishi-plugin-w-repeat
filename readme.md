@@ -7,9 +7,9 @@ WillBot: Advanced repeating functions
 ## Roadmap
 
 - [x] Repetition of images
-  - [ ] Fuzzy
+  - [ ] Fuzzy matching
 - [x] Suspension and resumption of repetition (A A A B A A B A A A ...)
 - [x] Real repetition starter (\*A B A A A ...)
   - [ ] Repetition with sliced source (ABC B B B ...)
-- [ ] Better graph
-  - [ ] Data normalization for flow graph
+- Better graph
+  - [x] Data normalization for flow graph

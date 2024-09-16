@@ -196,8 +196,10 @@ export async function apply(ctx: Context, config: Config) {
         }, {})
     }
 
-    const getMemberName = (member: GuildMember) =>
-        member.nick || member.name || member.user.name || member.user.id
+    const getMemberName = (memberDict: Record<string, GuildMember>, uid: string) => {
+        const member = memberDict[uid]
+        return member ? (member.nick || member.name || member.user.name || member.user.id) : uid
+    }
 
     // Command
     const requireList = (): Argv.OptionConfig => ({
@@ -563,7 +565,7 @@ export async function apply(ctx: Context, config: Config) {
             const topText = (action: string, tops: [string, number][]) => dedent`
                 ${action}最多的${topNum > 1 ? ` ${topNum} 名群友` : ''}是：${tops
                     .slice(0, topNum)
-                    .map(([ uid, count ]) => `[${getMemberName(memberDict[uid])} * ${count}]`)
+                    .map(([ uid, count ]) => `[${getMemberName(memberDict, uid)} * ${count}]`)
                     .join(', ')
                 }
             ` + (topNum >= 3 ? '\n' : '')
@@ -637,9 +639,11 @@ export async function apply(ctx: Context, config: Config) {
 
     ctx.command('repeat.graph.flow', '查看群复读流向图')
         .option('guild', '-g <guild:channel> 指定群（默认为本群）')
-        .option('duration', '-d <duration> 指定时间范围，可以为 day / week / month / all', {
-            type: /^(day|week|month|all)$/, fallback: 'day'
-        })
+        .option('minflow', '-m <minflow:string> 流量最小大小，低于该指的流向线条不显示，可用百分数表示最大流量的百分比', { fallback: 0 })
+        .option('duration',
+            '-d <duration:string> 指定时间范围。可以为 hour/day/week/month/all，或者用波浪号（~）分割的开始、结束时间',
+            { fallback: 'day' }
+        )
         .action(async ({ session, options }) => {
             if (! ctx.echarts) return '此指令需要 echarts 服务'
 
@@ -651,33 +655,80 @@ export async function apply(ctx: Context, config: Config) {
 
             const duration = options.duration as 'day' | 'week' | 'month' | 'all'
 
-            const starters: Record<string, { name: string, count: number }> = {}
+            const starterDict: Record<string, { name: string, count: number }> = {}
             const sendMat: Record<string, Record<string, { count: number }>> = {}
             const recs = await ctx.database
                 .select('w-repeat-record')
                 .where({
                     gid,
-                    startTime: duration === 'all'
-                        ? {}
-                        : { $gte: + dayjs().startOf(duration) }
+                    ...parseDuration(duration)
                 })
                 .execute()
 
             recs.forEach(rec => {
                 const starter = rec.senders[0]
-                void (starters[starter] ??= {
-                    name: getMemberName(memberDict[starter]),
+                void (starterDict[starter] ??= {
+                    name: getMemberName(memberDict, starter),
                     count: 0
                 }).count ++
                 rec.senders.slice(1).forEach(sender => {
                     ((sendMat[sender] ??= {})[starter] ??= { count: 0 }).count ++
                 })
             })
-            const starterNum = Object.keys(starters).length
 
             type GraphSeriesOption = echarts.RegisteredSeriesOption['graph']
 
-            // TODO: normalization
+            const starters = Object.entries(starterDict)
+                .map(([ uid, { name, count } ]) => ({ uid, name, count }))
+            const starterNum = starters.length
+            const maxRepeatedCount = Math.max(...starters.map(({ count }) => count))
+            const nodes = starters
+                .map<GraphSeriesOption['data'][number]>(({ uid, name, count }, i) => ({
+                    name: uid,
+                    label: {
+                        show: true,
+                        formatter: name,
+                        color: '#000',
+                        borderColor: 'transparent',
+                        shadowColor: 'transparent',
+                        fontSize: 22
+                    },
+                    symbolSize: count / maxRepeatedCount * 150,
+                    category: String(i)
+                }))
+
+            const flows = Object
+                .entries(sendMat)
+                .flatMap(([ source, targetRow ]) => Object
+                    .entries(targetRow)
+                    .map(([ target, { count } ]) => ({
+                        source,
+                        target,
+                        count
+                    }))
+                )
+            const maxRepeatFlowSize = Math.max(...flows.map(({ count }) => count))
+
+            const tryParseNumber = (s: string): number => {
+                const n = Number(s)
+                if (Number.isNaN(n)) throw new SessionError(`${s} 不是合法的数字`)
+                return n
+            }
+            const minFlowSize = options.minflow.endsWith('%')
+                ? maxRepeatFlowSize * .01 * tryParseNumber(options.minflow.slice(0, - 1))
+                : tryParseNumber(options.minflow)
+            const links = flows
+                .filter(flow => flow.count >= minFlowSize)
+                .map<GraphSeriesOption['links'][number]>(({ source, target, count }) => ({
+                    source,
+                    target,
+                    lineStyle: {
+                        width: count / maxRepeatFlowSize * 50,
+                        curveness: 0.2,
+                        type: 'solid',
+                        color: 'source'
+                    }
+                }))
 
             const eh = ctx.echarts.createChart(800, 800, {
                 series: {
@@ -695,36 +746,8 @@ export async function apply(ctx: Context, config: Config) {
                     categories: Array
                         .from({ length: starterNum })
                         .map((_, i) => ({ name: String(i) })),
-                    data: Object
-                        .entries(starters)
-                        .map<GraphSeriesOption['data'][number]>(([ uid, { name, count } ], i) => ({
-                            name: uid,
-                            label: {
-                                show: true,
-                                formatter: name,
-                                color: '#000',
-                                borderColor: 'transparent',
-                                shadowColor: 'transparent',
-                                fontSize: 22
-                            },
-                            symbolSize: count * 4,
-                            category: String(i)
-                        })),
-                    links: Object
-                        .entries(sendMat)
-                        .flatMap(([ source, targetRow ]) => Object
-                            .entries(targetRow)
-                            .map<GraphSeriesOption['links'][number]>(([ target, { count } ]) => ({
-                                source,
-                                target,
-                                lineStyle: {
-                                    width: count * 2,
-                                    curveness: 0.2,
-                                    type: 'solid',
-                                    color: 'source'
-                                }
-                            }))
-                        )
+                    data: nodes,
+                    links
                 },
                 backgroundColor: '#fff'
             })
@@ -832,7 +855,7 @@ export async function apply(ctx: Context, config: Config) {
             }
 
             const sendersText = options['all-senders']
-                ? rec.senders.map(uid => getMemberName(memberDict[uid])).join('，')
+                ? rec.senders.map(uid => getMemberName(memberDict, uid)).join('，')
                 : `${rec.senders.length} 个`
 
             const suspensionText = rec.suspensions?.length
@@ -848,9 +871,9 @@ export async function apply(ctx: Context, config: Config) {
             return dedent`
                 复读 #${id} 详情
                 群：${guild.name}${guildId === session.guildId ? '（本群）' : ''}
-                发起者：${getMemberName(memberDict[rec.senders[0]])}
+                发起者：${getMemberName(memberDict, rec.senders[0])}
                 发起时间：${timeText(rec.startTime)}
-                打断者：${getMemberName(memberDict[rec.interrupter])}
+                打断者：${getMemberName(memberDict, rec.interrupter)}
                 参与者：${sendersText}
                 打断时间：${timeText(rec.endTime)}
                 挂起情况：${suspensionText}
