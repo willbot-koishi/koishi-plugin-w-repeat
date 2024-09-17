@@ -487,6 +487,8 @@ export async function apply(ctx: Context, config: Config) {
     }, true)
 
     // 复读指令
+    ctx.command('repeat', '群复读功能')
+
     ctx.command('repeat.me', '查看我的复读统计')
         .action(async ({ session: { uid } }) => {
             const [ user ] = await ctx.database.get('w-repeat-user', { uid })
@@ -639,7 +641,7 @@ export async function apply(ctx: Context, config: Config) {
                 )
         })
 
-    ctx.command('repeat.graph', '查看复读相zasxxaxxszaz表')
+    ctx.command('repeat.graph', '查看复读相关图表')
         .alias('repeat.g')
 
     ctx.command('repeat.graph.flow', '查看群复读流向图')
