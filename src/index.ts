@@ -144,9 +144,14 @@ export async function apply(ctx: Context, config: Config) {
 
     // 初始化 tesseract Worker
 
-    const { ocrLangs } = config 
-    await ctx.tesseract.installNecessaryLangs(ocrLangs)
-    const tesseractWorker = await ctx.tesseract.createWorker(ocrLangs)
+    let tesseractWorker = undefined
+    const initTesseract = async () => {
+        if (! config.doOcr) return
+        const { ocrLangs } = config 
+        await ctx.tesseract.installNecessaryLangs(ocrLangs)
+        tesseractWorker = await ctx.tesseract.createWorker(ocrLangs)
+    }
+    await initTesseract()
 
     // 工具函数
     // String
@@ -445,7 +450,7 @@ export async function apply(ctx: Context, config: Config) {
                         interruptTime: $inc(row.interruptTime)
                     }]),
                     // 识别图片中文字
-                    (config.doProcessImage && config.doOcr && ctx.tesseract) ? updateImageText(currentRec) : undefined
+                    (config.doProcessImage && config.doOcr && tesseractWorker) ? updateImageText(currentRec) : undefined
                 ])
 
                 // 如果允许挂起，挂起被打断的复读
@@ -849,7 +854,7 @@ export async function apply(ctx: Context, config: Config) {
                 )
 
                 if (options.ocr) {
-                    if (ctx.tesseract) await updateImageText(rec)
+                    if (tesseractWorker) await updateImageText(rec)
                     else return 'tesseract 服务未加载，无法识别图片中文字'
                 }
             }
@@ -924,8 +929,11 @@ export async function apply(ctx: Context, config: Config) {
                 ctx.scope.update(config)
             }
             return dedent`
-                复读配置：
-                已开启复读写入：${config.doWrite}
+                复读配置
+                ====================
+                复读写入：${config.doWrite}
+                处理图片：${config.doProcessImage}
+                自动识别图片：${config.doOcr}
                 复读内容黑名单：${config.repeatBlacklist.map(re => `/${re}/`).join(', ')}
             `
         })
@@ -984,6 +992,6 @@ export async function apply(ctx: Context, config: Config) {
     // 回收副作用
     ctx.on('dispose', () => {
         // 终止 tesseract Worker
-        tesseractWorker.terminate()
+        tesseractWorker?.terminate()
     })
 }
