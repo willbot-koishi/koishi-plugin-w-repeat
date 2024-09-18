@@ -295,6 +295,14 @@ export async function apply(ctx: Context, config: Config) {
         unrelatedCount: 0
     })
 
+    const unescapeMessage = (message: RepeatMessage): string => {
+        let imageIdx = 0
+        return message.content.replace(
+            /@__KOISHI_IMG__@/g,
+            () => h.img('data:image/png;base64,' + message.images[imageIdx ++].b64).toString()
+        )
+    }
+
     // 复读中间件
     const runtimes: Record<string, RepeatRuntime> = {}
     ctx.middleware(async (session, next) => {
@@ -480,7 +488,8 @@ export async function apply(ctx: Context, config: Config) {
         }
 
         // 机器人复读
-        if (isRepeating && repeatCount === config.repeatCount) return content
+        if (isRepeating && repeatCount === config.repeatCount)
+            return unescapeMessage(thisMessage)
 
         // 传向下一个中间件
         return next()
@@ -612,17 +621,7 @@ export async function apply(ctx: Context, config: Config) {
                     ${recs
                         .slice((pageId - 1) * pageSize, pageId * pageSize)
                         .map((rec, i) => {
-                            let imageIdx = 0
-                            const content = ellipsis(
-                                rec.content.replace(/@__KOISHI_IMG__@/g, () => {
-                                    const image = rec.images[imageIdx ++]
-                                    const text = image.text.trim()
-                                    return text
-                                        ? `[图片: ${ellipsis(text, config.imageTextDisplayLength)}]`
-                                        : '[图片]'
-                                }),
-                                displayLength
-                            )
+                            const content = ellipsis(unescapeMessage(rec), displayLength)
                             const times = ` * ${rec.senders.length}`
                             const extra = sortMethod === 'tps' ? `, ${rec.tps.toFixed(2)}/s` : ''
                             return `${i + 1}. [${content}${times}${extra}] # ${rec.id}`
@@ -849,11 +848,7 @@ export async function apply(ctx: Context, config: Config) {
                 content = '[已删除]'
             }
             else {
-                let imageIdx = 0
-                content = rec.content.replace(
-                    /@__KOISHI_IMG__@/g,
-                    () => h.img('data:image/png;base64,' + rec.images[imageIdx ++].b64).toString()
-                )
+                content = unescapeMessage(rec)
 
                 if (options.ocr) {
                     if (tesseractWorker) await updateImageText(rec)
