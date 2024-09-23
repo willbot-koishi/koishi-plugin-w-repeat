@@ -155,9 +155,24 @@ export async function apply(ctx: Context, config: Config) {
 
     // 工具函数
     // String
-    const ellipsis = (text: string, maxLength: number) => text.length < maxLength
-        ? text
-        : text.slice(0, maxLength - 3) + '...'
+    const ellipsis = (input: string, maxLength: number): string => {
+        const els = h.parse(input)
+        let length = 0
+        let output = ''
+        for (const el of els) {
+            if (el.type === 'text') {
+                const text = el.toString()
+                length += text.length
+                if (length > maxLength) {
+                    output += text.slice(0, text.length - (length - maxLength) - 3) + '...'
+                    break
+                }
+                output += text
+            }
+            else output += el.toString() // TODO: length of other elements
+        }
+        return output
+    }
 
     const timeText = (time: number) => dayjs(time).format('YYYY/MM/DD HH:mm:ss')
 
@@ -295,11 +310,16 @@ export async function apply(ctx: Context, config: Config) {
         unrelatedCount: 0
     })
 
-    const unescapeMessage = (message: RepeatMessage): string => {
+    const unescapeMessage = (message: RepeatMessage, { allowImage = true }: { allowImage?: boolean } = {}): string => {
         let imageIdx = 0
         return message.content.replace(
             /@__KOISHI_IMG__@/g,
-            () => h.img('data:image/png;base64,' + message.images[imageIdx ++].b64).toString()
+            () =>  {
+                const image = message.images[imageIdx ++]
+                return allowImage
+                    ? h.img('data:image/png;base64,' + image.b64).toString()
+                    : `[图片${ image.text ? ': ' + image.text : '' }]`
+            }
         )
     }
 
@@ -524,10 +544,9 @@ export async function apply(ctx: Context, config: Config) {
         .option('list', '-L 不显示复读记录列表', { value: false })
         .option('top', '-t <top:natural> 排行榜人数', { fallback: 1 })
         .option('filter', '-f <content:string> 根据查找复读记录', requireList())
-        // TODO: wait for <https://github.com/cordiverse/minato/pull/109>
-        // .option('starter', '-s [user:user] 根据发起者查找（默认为自己）', requireList())
-        // .option('repeater', '-r [user:user] 根据参与者查找（默认为自己）', requireList())
-        // .option('interrupter', '-i [user:user] 根据打断者查找（默认为自己）', requireList())
+        .option('starter', '--us <user:user> 根据发起者查找（默认为自己）', requireList())
+        .option('repeater', '--ur <user:user> 根据参与者查找（默认为自己）', requireList())
+        .option('interrupter', '--ui <user:user> 根据打断者查找（默认为自己）', requireList())
         .option('jsfilter', '-j <code:string>', {
             authority: 4,
             conflictsWith: [ 'filter', { option: 'list', value: false } ]
@@ -536,12 +555,13 @@ export async function apply(ctx: Context, config: Config) {
         .action(async ({ session, options }) => {
             if (! session.guildId && ! options.guild) return '请在群内调用'
             const gid = options.guild ?? session.gid
-            const [, guildId ] = gid.split(':')
 
-            const { filter, jsfilter, top: topNum, duration } = options
+            const { jsfilter, top: topNum, duration } = options
             const [ sortMethod = 'count', sortDirection = 'desc' ] = options.sort.split(':') as [
                 'count' | 'tps' | 'startTime', Direction
             ]
+            const isFiltered = ([ 'filter', 'starter', 'repeater', 'interrupter' ] satisfies (keyof typeof options)[])
+                .some(name => name in options)
 
             // TODO: wait for row destruction
             const reserveProjection = getReserveProjection<RepeatRecord>([
@@ -550,14 +570,23 @@ export async function apply(ctx: Context, config: Config) {
 
             let recs = await ctx.database
                 .select('w-repeat-record')
-                .where({
+                .where(row => $.query(row, {
                     gid,
-                    ...parseDuration(duration),
-                    ...(filter
-                        ? { content: { $regex: new RegExp(filter) } }
-                        : {}
-                    )
-                })
+                    ...parseDuration(duration)
+                }, $.and(
+                    options.filter
+                        ? $.regex(row.content, options.filter)
+                        : true,
+                    options.starter
+                        ? $.eq($.get(row.senders, 0), options.starter)
+                        : true,
+                    options.repeater
+                        ? $.in(options.repeater, row.senders)
+                        : true,
+                    options.interrupter
+                        ? $.eq(row.interrupter, options.interrupter)
+                        : true
+                )))
                 .project({
                     ...reserveProjection,
                     count: row => $.length(row.senders)
@@ -576,7 +605,7 @@ export async function apply(ctx: Context, config: Config) {
             const topStarters = countAndSortBy(recs, rec => rec.senders[0])
             const topRepeaters = countAndSortBy(recs, rec => rec.senders)
 
-            const memberDict = await getMemberDict(session, guildId)
+            const memberDict = await getMemberDict(session, session.guildId)
 
             const topText = (action: string, tops: [string, number][]) => dedent`
                 ${action}最多的${topNum > 1 ? ` ${topNum} 名群友` : ''}是：${tops
@@ -592,7 +621,7 @@ export async function apply(ctx: Context, config: Config) {
                 'day': '今日',
                 'week': '本周',
                 'month': '本月'
-            }[duration] ?? `在 ${duration} `
+            } [duration] ?? `在 ${duration} `
             const { [sortMethod]: sortMethodText } = {
                 'count': '复读次数',
                 'tps': '每秒复读次数',
@@ -607,6 +636,12 @@ export async function apply(ctx: Context, config: Config) {
             const groupText = options.guild
                 ? (await session.bot.getGuild(gid.split(':')[1])).name
                 : '本群'
+            const filterText = [
+                options.starter && `由 ${ getMemberName(memberDict, options.starter) } 发起的`,
+                options.repeater && `有 ${ getMemberName(memberDict, options.repeater) } 参与的`,
+                options.interrupter && `被 ${ getMemberName(memberDict, options.interrupter) } 打断的`,
+                options.filter && `符合 /${options.filter}/ 的`
+            ].filter(s => s).join('、')
             if (! total) return `${groupText}${durationText}还没有复读。在？为什么不复读？`
 
             const { displayPageSize: pageSize, displayLength } = config
@@ -614,30 +649,31 @@ export async function apply(ctx: Context, config: Config) {
             const pageId = options.page
             if (pageId < 1 || pageId > pageNum) return `页数必须为 1 到 ${pageNum} 间的整数。`
 
+            const getListText = () => recs
+                .slice((pageId - 1) * pageSize, pageId * pageSize)
+                .map((rec, i) => {
+                    const content = ellipsis(unescapeMessage(rec, { allowImage: false }), displayLength)
+                    const times = ` * ${rec.senders.length}`
+                    const extra = sortMethod === 'tps' ? `, ${rec.tps.toFixed(2)}/s` : ''
+                    return `${i + 1}. [${content}${times}${extra}] # ${rec.id}`
+                })
+                .join('\n')
+
             return (options.list
                 ? dedent`
-                    ${groupText}${durationText}共有 ${recs.length} 次${options.filter ? `符合 /${options.filter}/ 的` : ''}复读
+                    ${groupText}${durationText}共有 ${recs.length} 次${filterText}复读
                     按${sortMethodText}${sortDirectionText}排序依次为：（第 ${pageId} / ${pageNum} 页）
-                    ${recs
-                        .slice((pageId - 1) * pageSize, pageId * pageSize)
-                        .map((rec, i) => {
-                            const content = ellipsis(unescapeMessage(rec), displayLength)
-                            const times = ` * ${rec.senders.length}`
-                            const extra = sortMethod === 'tps' ? `, ${rec.tps.toFixed(2)}/s` : ''
-                            return `${i + 1}. [${content}${times}${extra}] # ${rec.id}`
-                        })
-                        .join('\n')
-                    }
+                    ${getListText()}
                 ` + '\n\n'
                 : ''
-            ) + (filter || topNum === 0
-                ? ''
-                : dedent`   
-                    ${topText('参与复读', topRepeaters)}
-                    ${topText('发起复读', topStarters)}
-                    ${topText('打断复读', topInterrupters)}
+            ) + (! isFiltered && topNum > 0
+                ? dedent`   
+                    ${ topText('参与复读', topRepeaters) }
+                    ${ topText('发起复读', topStarters) }
+                    ${ topText('打断复读', topInterrupters) }
                 `
-                )
+                : ''
+            )
         })
 
     ctx.command('repeat.graph', '查看复读相关图表')
@@ -645,7 +681,7 @@ export async function apply(ctx: Context, config: Config) {
 
     ctx.command('repeat.graph.flow', '查看群复读流向图')
         .option('guild', '-g <guild:channel> 指定群（默认为本群）')
-        .option('minflow', '-m <minflow:string> 流量最小大小，低于该指的流向线条不显示，可用百分数表示最大流量的百分比', { fallback: 0 })
+        .option('minflow', '-m <minflow:string> 流量最小大小，低于该指的流向线条不显示，可用百分数表示最大流量的百分比', { fallback: '0' })
         .option('duration',
             '-d <duration:string> 指定时间范围。可以为 hour/day/week/month/all，或者用波浪号（~）分割的开始、结束时间',
             { fallback: 'day' }
@@ -659,15 +695,13 @@ export async function apply(ctx: Context, config: Config) {
 
             const memberDict = await getMemberDict(session, guildId)
 
-            const duration = options.duration as 'day' | 'week' | 'month' | 'all'
-
             const starterDict: Record<string, { name: string, count: number }> = {}
             const sendMat: Record<string, Record<string, { count: number }>> = {}
             const recs = await ctx.database
                 .select('w-repeat-record')
                 .where({
                     gid,
-                    ...parseDuration(duration)
+                    ...parseDuration(options.duration)
                 })
                 .execute()
 
@@ -849,7 +883,6 @@ export async function apply(ctx: Context, config: Config) {
             }
             else {
                 content = unescapeMessage(rec)
-
                 if (options.ocr) {
                     if (tesseractWorker) await updateImageText(rec)
                     else return 'tesseract 服务未加载，无法识别图片中文字'
@@ -917,6 +950,7 @@ export async function apply(ctx: Context, config: Config) {
         .action(() => '运行时列表：' + Object.keys(runtimes).join(', '))
 
     ctx.command('repeat.admin', '复读管理', { hidden: true })
+        .alias('repeat.a')
 
     ctx.command('repeat.admin.conf', '查看复读配置')
         .option('switch', '-S 开关复读写入', { authority: 4 })
