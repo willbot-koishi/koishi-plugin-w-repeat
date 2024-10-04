@@ -508,8 +508,7 @@ export async function apply(ctx: Context, config: Config) {
         }
 
         // 机器人复读
-        if (isRepeating && repeatCount === config.repeatCount)
-            return unescapeMessage(thisMessage)
+        if (repeatCount === config.repeatCount) return unescapeMessage(thisMessage)
 
         // 传向下一个中间件
         return next()
