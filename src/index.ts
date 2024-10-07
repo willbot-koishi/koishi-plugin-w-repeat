@@ -405,17 +405,17 @@ export async function apply(ctx: Context, config: Config) {
             runtime[recsName] = runtime[recsName].filter(rec => ! rec.deleted) as RepeatRuntime[K]
         }
 
-        let newRec = true 
+        let isNewRec = true 
 
         // 处理挂起的复读
         await procRecs('suspendedRecs', async rec => {
             // 如果当前消息构成复读，则恢复挂起的复读
             if (isRepeating) {
                 // 将挂起的复读记录分离为挂起信息和恢复的复读
-                const [ suspension, resumed ] = pickOr(rec, ['suspendTime', 'resumeTime'])
+                const [ suspension, resumed ] = pickOr(rec, [ 'suspendTime', 'resumeTime' ])
                 // 添加挂起信息到恢复的复读中
                 resumed.suspensions.push({
-                    ...pick(suspension, ['suspendTime']),
+                    ...pick(suspension, [ 'suspendTime' ]),
                     resumeTime: Date.now()
                 })
                 // 将挂起的复读移出复读记录表，并标记从运行时中删除
@@ -423,8 +423,8 @@ export async function apply(ctx: Context, config: Config) {
                 rec.deleted = true
 
                 // 用恢复的复读替换当前复读
-                newRec = false
-                runtime.currentRec = omit(resumed, ['id'])
+                isNewRec = false
+                runtime.currentRec = omit(resumed, [ 'id' ])
             }
         })
 
@@ -459,7 +459,7 @@ export async function apply(ctx: Context, config: Config) {
             // 处理未激活的复读
             await procRecs('queuedRecs', async rec => {
                 // 用新激活的复读替换当前复读
-                newRec = false
+                isNewRec = false
                 currentRec = runtime.currentRec = rec
             })
 
@@ -493,7 +493,7 @@ export async function apply(ctx: Context, config: Config) {
             }
 
             // 如果需要新建当前复读
-            if (newRec) {
+            if (isNewRec) {
                 // 新建当前复读，包含内容、图片、开始时间、第一个发送者的信息
                 runtime.currentRec = currentRec = {
                     ...createCurrentRec(gid),
@@ -508,7 +508,7 @@ export async function apply(ctx: Context, config: Config) {
         }
 
         // 机器人复读
-        if (repeatCount === config.repeatCount) return unescapeMessage(thisMessage)
+        if (currentRec.senders.length === config.repeatCount) return unescapeMessage(thisMessage)
 
         // 传向下一个中间件
         return next()
@@ -845,7 +845,7 @@ export async function apply(ctx: Context, config: Config) {
                 },
                 yAxis: {
                     type: 'category',
-                    data: ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'],
+                    data: [ 'Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat' ],
                     splitArea: { show: true }
                 },
                 visualMap: {
