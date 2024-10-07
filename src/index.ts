@@ -517,9 +517,9 @@ export async function apply(ctx: Context, config: Config) {
     // 复读指令
     ctx.command('repeat', '群复读功能')
 
-    ctx.command('repeat.me', '查看我的复读统计')
-        .action(async ({ session: { uid } }) => {
-            const [ user ] = await ctx.database.get('w-repeat-user', { uid })
+    ctx.command('repeat.user [user:user]', '查看用户复读统计')
+        .action(async ({ session }, uid) => {
+            const [ user ] = await ctx.database.get('w-repeat-user', { uid: uid || session.uid })
             if (! user) return `还没有复读统计`
             return dedent`
                 复读条数：　　${user.repeatCount}
