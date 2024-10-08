@@ -16,6 +16,8 @@ import dedent from 'dedent'
 import dayjs from 'dayjs'
 import format from 'pretty-format'
 
+import { botRepeat } from './botRepeat'
+
 export const name = 'w-repeat'
 
 export const inject = {
@@ -310,7 +312,10 @@ export async function apply(ctx: Context, config: Config) {
         unrelatedCount: 0
     })
 
-    const unescapeMessage = (message: RepeatMessage, { allowImage = true }: { allowImage?: boolean } = {}): string => {
+    const unescapeMessage = (
+        message: RepeatMessage,
+        { allowImage = true }: { allowImage?: boolean } = {}
+    ): string => {
         let imageIdx = 0
         return message.content.replace(
             /@__KOISHI_IMG__@/g,
@@ -508,7 +513,8 @@ export async function apply(ctx: Context, config: Config) {
         }
 
         // 机器人复读
-        if (currentRec.senders.length === config.repeatCount) return unescapeMessage(thisMessage)
+        if (currentRec.senders.length === config.repeatCount)
+            return botRepeat(h.parse(unescapeMessage(thisMessage)))
 
         // 传向下一个中间件
         return next()
