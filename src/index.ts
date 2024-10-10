@@ -2,8 +2,10 @@ import {
     h, z,
     Argv, Context, Session, SessionError,
     $, Direction, Row, Query,
-    Awaitable,
-    Fragment
+    Fragment,
+    Dict,
+    Selection,
+    Awaitable
 } from 'koishi'
 import { type GuildMember } from '@satorijs/protocol'
 
@@ -13,7 +15,7 @@ import {} from 'koishi-plugin-w-echarts'
 import {} from 'koishi-plugin-w-tesseract'
 
 import dedent from 'dedent'
-import dayjs from 'dayjs'
+import dayjs, { Dayjs } from 'dayjs'
 import format from 'pretty-format'
 
 import { botRepeat } from './botRepeat'
@@ -57,6 +59,7 @@ declare module 'koishi' {
     interface Tables {
         'w-repeat-record': RepeatRecord         // 复读记录表
         'w-repeat-user': RepeatUser             // 复读用户表
+        'w-repeat-calendar': RepeatDay          // 复读日历
     }
 }
 
@@ -117,6 +120,14 @@ export interface RepeatUser {
     interruptTime: number
 }
 
+export interface RepeatDay {
+    gid: string
+    month: string
+    day: string
+    topSenderId: string
+    topSenderCount: number
+}
+
 export async function apply(ctx: Context, config: Config) {
     // 扩展数据库模型
     ctx.model.extend('w-repeat-record', {
@@ -143,6 +154,16 @@ export async function apply(ctx: Context, config: Config) {
         beRepeatedCount: counterField(),
         interruptTime: counterField()
     }, { primary: 'uid' })
+
+    ctx.model.extend('w-repeat-calendar', {
+        gid: 'string',
+        month: 'string',
+        day: 'string',
+        topSenderId: 'string',
+        topSenderCount: 'unsigned'
+    }, {
+        primary: [ 'gid', 'month', 'day' ]
+    })
 
     // 初始化 tesseract Worker
 
@@ -195,6 +216,11 @@ export async function apply(ctx: Context, config: Config) {
     const countAndSortBy = <T extends {}, K extends keyof any>(xs: T[], key: (x: T) => K | K[]) =>
         Object.entries(countBy(xs, key)).sort(([, count1 ], [, count2 ]) => count2 - count1)
 
+    const exclude = <T>(xs: T[], ys: T[]): T[] => {
+        const yset = new Set(ys)
+        return xs.filter(x => ! yset.has(x))
+    }
+
     // Dict
     const pick = <T extends {}, K extends keyof T>(x: T, keys: K[]): Pick<T, K> =>
         Object.fromEntries(Object.entries(x).filter(([ k ]) => keys.includes(k as any))) as any
@@ -209,11 +235,25 @@ export async function apply(ctx: Context, config: Config) {
         return [ xPick, xOmit ]
     }
 
+    // Date
+    const getDaysOfMonth = (date: Dayjs = dayjs()) => {
+        const days: string[] = []
+        const month = date.get('month')
+        for (let day = date.startOf('month'); day.get('month') === month; day = day.add(1, 'day'))
+            days.push(day.format('DD'))
+        return days
+    }
+
+    const removeUndefined = <const T>(x: T): T => {
+        for (const k in x) if (x[k] === undefined) delete x[k]
+        return x
+    }
+
     // Adapter
     const getMemberDict = async (session: Session, guildId: string) => {
         const { data: memberList } = await session.bot.getGuildMemberList(guildId)
         return memberList.reduce<Record<string, GuildMember>>((dict, member) => {
-            dict[session.platform + ':' + member.user.id] = member
+            dict[`${session.platform}:${member.user.id}`] = member
             return dict
         }, {})
     }
@@ -291,7 +331,6 @@ export async function apply(ctx: Context, config: Config) {
         const { images } = rec
 
         await Promise.all(images.filter(x => x !== null).map(async ({ b64 }, i) => {
-            if (! b64) console.log(images)
             const res = await tesseractWorker.recognize(Buffer.from(b64, 'base64'))
             const { text } = res.data
             images[i].text = text
@@ -332,11 +371,11 @@ export async function apply(ctx: Context, config: Config) {
     const runtimes: Record<string, RepeatRuntime> = {}
     ctx.middleware(async (session, next) => {
         // 配置为不写入则跳过
-        if (!config.doWrite) return next()
+        if (! config.doWrite) return next()
 
         // 只处理群内消息
         const { content: originalContent, gid, uid } = session
-        if (!session.guildId) return next()
+        if (! session.guildId) return next()
 
         // 过滤内容黑名单
         if (config.repeatBlacklist.some(re => new RegExp(re).test(originalContent)))
@@ -567,7 +606,7 @@ export async function apply(ctx: Context, config: Config) {
             if (! isGlobal) gid ||= session.gid
 
             const [ sortMethod = 'count', sortDirection = 'desc' ] = options.sort.split(':') as [
-                'count' | 'tps' | 'startTime', Direction
+                'count' | 'tps' | 'length' | 'startTime', Direction
             ]
             const isFiltered = ([ 'filter', 'starter', 'repeater', 'interrupter' ] satisfies (keyof typeof options)[])
                 .some(name => name in options)
@@ -600,12 +639,14 @@ export async function apply(ctx: Context, config: Config) {
                     ...reserveProjection,
                     count: row => $.length(row.senders)
                 })
-                .project({
+                .project(removeUndefined({
                     ...reserveProjection,
                     count: row => row.count,
-                    tps: row => $.mul($.div(row.count, $.sub(row.endTime, row.startTime)), 1000)
-                })
-                .orderBy(sortMethod, sortDirection)
+                    tps: sortMethod === 'tps'
+                        ? row => $.mul($.div(row.count, $.sub(row.endTime, row.startTime)), 1000)
+                        : undefined
+                } satisfies Dict<Selection.Callback<RepeatRecord & { count: number }>>))
+                .orderBy(sortMethod as any, sortDirection)
                 .execute()
 
             if (jsfilter) recs = recs.filter(eval(jsfilter))
@@ -634,7 +675,8 @@ export async function apply(ctx: Context, config: Config) {
             const { [sortMethod]: sortMethodText } = {
                 'count': '复读次数',
                 'tps': '每秒复读次数',
-                'startTime': '开始时间'
+                'startTime': '开始时间',
+                'length': '消息长度'
             } satisfies Record<typeof sortMethod, string>
             const { [sortDirection]: sortDirectionText } = {
                 'desc': '降序',
@@ -666,7 +708,10 @@ export async function apply(ctx: Context, config: Config) {
                 .map((rec, i) => {
                     const content = ellipsis(unescapeMessage(rec, { allowImage: false }), displayLength)
                     const times = ` * ${rec.senders.length}`
-                    const extra = sortMethod === 'tps' ? `, ${rec.tps.toFixed(2)}/s` : ''
+                    const extra =
+                        sortMethod === 'tps' ? `, ${rec.tps.toFixed(2)}/s` :
+                        // sortMethod === 'length' ? `, ${rec.length}ch` :
+                        ''
                     return `${i + 1}. [${content}${times}${extra}] # ${rec.id}`
                 })
                 .join('\n')
@@ -867,6 +912,160 @@ export async function apply(ctx: Context, config: Config) {
                     data
                 },
                 backgroundColor: '#fff'
+            })
+
+            return eh.export()
+        })
+
+    ctx.command('repeat.graph.top-calendar', '查看群复读排行日历')
+        .option('guild', '-g <guild:channel> 指定群（默认为本群）')
+        .option('avatar', '-a 使用头像', { fallback: true })
+        .option('avatar', '-A 不使用头像', { value: false })
+        .action(async ({ session, options }) => {
+            if (! ctx.echarts) return '此指令需要 echarts 服务'
+
+            if (! session.guildId && ! options.guild) return '请在群内调用'
+            const gid = options.guild ?? session.gid
+
+            const date = dayjs()
+            const days = getDaysOfMonth(date)
+            const month = date.format('YYYY-MM')
+            const today = date.format('DD')
+            const dataExists = await ctx.database.get('w-repeat-calendar', {
+                month: 'YYYY-MM',
+                day: { $ne: today }
+            })
+            const missingDays = exclude(days, dataExists.map(rec => rec.month))
+
+            let maxCount = 0
+            const [ memberDict, dataToUpsert ] = await Promise.all([
+                getMemberDict(session, gid.split(':')[1]),
+                Promise.all(missingDays.map(async day => {
+                    const date = dayjs(`${month}-${day}`)
+                    const start = + date.startOf('day')
+                    const end = + date.endOf('day')
+                    const recs = await ctx.database.get('w-repeat-record', {
+                        gid,
+                        startTime: { $gte: start, $lte: end }
+                    })
+                    if (! recs.length) return { month, day }
+                    const senderDict: Record<string, number> = {}
+                    recs.forEach(rec => {
+                        rec.senders.forEach(sender => {
+                            senderDict[sender] ??= 0
+                            senderDict[sender] ++
+                        })
+                    })
+                    const [ [ topSenderId, topSenderCount ] ] = Object
+                        .entries(senderDict)
+                        .sort(([, count1 ], [, count2 ]) => count2 - count1)
+                    if (topSenderCount > maxCount) maxCount = topSenderCount
+                    return {
+                        month,
+                        day,
+                        topSenderId,
+                        topSenderCount
+                    }
+                }))
+            ])
+
+            ctx.database.upsert('w-repeat-calendar', () => dataToUpsert)
+            
+            const data = [ ...dataExists, ...dataToUpsert ]
+
+            const CELL_SIZE = 80
+
+            const eh = ctx.echarts.createChart(700, 500, {
+                backgroundColor: '#fff',
+                calendar: {
+                    orient: 'vertical',
+                    yearLabel: {
+                        margin: 40,
+                        color: '#000',
+                        fontSize: 22,
+                        fontWeight: 800,
+                    },
+                    monthLabel: {
+                        nameMap: 'cn',
+                        margin: 20,
+                        fontSize: 20,
+                        fontWeight: 600
+                    },
+                    dayLabel: {
+                        nameMap: [ 'Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat' ],
+                        firstDay: 1,
+                        fontSize: 17
+                    },
+                    cellSize: CELL_SIZE,
+                    range: month
+                },
+                visualMap: {
+                    min: 0,
+                    max: maxCount,
+                    calculable: true,
+                    show: false
+                },
+                series: {
+                    type: 'custom',
+                    coordinateSystem: 'calendar',
+                    renderItem: (_, api) => {
+                        const day = api.value('day') as string
+                        const id = api.value('id') as string
+                        const count = api.value('count') as number
+                        const [ x, y ] = api.coord(`${month}-${day}`)
+                        return {
+                            type: 'group',
+                            children: [
+                                id ? {
+                                    type: 'image',
+                                    style: {
+                                        x: x - CELL_SIZE / 2 + 2,
+                                        y: y - CELL_SIZE / 2 + 2,
+                                        width: CELL_SIZE - 4,
+                                        height: CELL_SIZE - 4,
+                                        image: memberDict[id].user.avatar,
+                                        shadowColor: 'blue  ',
+                                        shadowBlur: day === today ? 2 : 0,
+                                    },
+                                    focus: 'none',
+                                    emphasisDisabled: true
+                                } as const : null,
+                                id ? {
+                                    type: 'text',
+                                    style: {
+                                        text: String(count),
+                                        x,
+                                        y: y + CELL_SIZE / 2 - 20 - 2,
+                                        align: 'center',
+                                        fill: '#000',
+                                        textFont: api.font({ fontSize: 16, fontWeight: 'bold' }),
+                                        textShadowBlur: 3,
+                                        textShadowColor: '#eee'
+                                    }
+                                } as const : null,
+                                {
+                                    type: 'text',
+                                    style: {
+                                        x: x - CELL_SIZE / 2 + 2,
+                                        y: y - CELL_SIZE / 2 + 2,
+                                        text: day,
+                                        fill: '#000',
+                                        textFont: api.font({ fontSize: 16 })
+                                    }
+                                } as const
+                            ].filter(child => child !== null)
+                        }
+                    },
+                    dimensions: [
+                        undefined,
+                        { name: 'day', type: 'ordinal' },
+                        { name: 'id', type: 'ordinal' },
+                        { name: 'count', type: 'int' }
+                    ],
+                    data: data.map(({ day, topSenderId, topSenderCount }) =>
+                        [ undefined, day, topSenderId, topSenderCount ]
+                    ),
+                }
             })
 
             return eh.export()
