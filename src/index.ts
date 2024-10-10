@@ -918,6 +918,7 @@ export async function apply(ctx: Context, config: Config) {
         })
 
     ctx.command('repeat.graph.top-calendar', '查看群复读排行日历')
+        .alias('repeat.graph.topc')
         .option('guild', '-g <guild:channel> 指定群（默认为本群）')
         .option('avatar', '-a 使用头像', { fallback: true })
         .option('avatar', '-A 不使用头像', { value: false })
@@ -980,10 +981,7 @@ export async function apply(ctx: Context, config: Config) {
                 calendar: {
                     orient: 'vertical',
                     yearLabel: {
-                        margin: 40,
-                        color: '#000',
-                        fontSize: 22,
-                        fontWeight: 800,
+                        show: false
                     },
                     monthLabel: {
                         nameMap: 'cn',
@@ -994,6 +992,7 @@ export async function apply(ctx: Context, config: Config) {
                     dayLabel: {
                         nameMap: [ 'Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat' ],
                         firstDay: 1,
+                        margin: 20,
                         fontSize: 17
                     },
                     cellSize: CELL_SIZE,
@@ -1013,47 +1012,51 @@ export async function apply(ctx: Context, config: Config) {
                         const id = api.value('id') as string
                         const count = api.value('count') as number
                         const [ x, y ] = api.coord(`${month}-${day}`)
+                        
+                        type CustomSeriesOption = echarts.RegisteredSeriesOption['custom']
+                        type CustomGroupOption = ReturnType<CustomSeriesOption['renderItem']> & { type: 'group' }
+
+                        const children: CustomGroupOption['children'] = [
+                            id ? {
+                                type: 'image',
+                                style: {
+                                    x: x - CELL_SIZE / 2 + 4,
+                                    y: y - CELL_SIZE / 2 + 4,
+                                    width: CELL_SIZE - 8,
+                                    height: CELL_SIZE - 8,
+                                    image: memberDict[id].user.avatar,
+                                    shadowColor: '#73b9bc',
+                                    shadowBlur: day === today ? 4 : 0,
+                                }
+                            } : null,
+                            id ? {
+                                type: 'text',
+                                style: {
+                                    text: String(count),
+                                    x,
+                                    y: y + CELL_SIZE / 2 - 20 - 2,
+                                    align: 'center',
+                                    fill: '#000',
+                                    stroke: '#fff',
+                                    lineWidth: 2,
+                                    textFont: api.font({ fontSize: 16, fontWeight: 'bold' })
+                                }
+                            } : null,
+                            {
+                                type: 'text',
+                                style: {
+                                    x: x - CELL_SIZE / 2 + 2,
+                                    y: y - CELL_SIZE / 2 + 2,
+                                    text: day,
+                                    fill: '#000',
+                                    textFont: api.font({ fontSize: 16 })
+                                }
+                            }
+                        ]
+
                         return {
                             type: 'group',
-                            children: [
-                                id ? {
-                                    type: 'image',
-                                    style: {
-                                        x: x - CELL_SIZE / 2 + 2,
-                                        y: y - CELL_SIZE / 2 + 2,
-                                        width: CELL_SIZE - 4,
-                                        height: CELL_SIZE - 4,
-                                        image: memberDict[id].user.avatar,
-                                        shadowColor: 'blue  ',
-                                        shadowBlur: day === today ? 2 : 0,
-                                    },
-                                    focus: 'none',
-                                    emphasisDisabled: true
-                                } as const : null,
-                                id ? {
-                                    type: 'text',
-                                    style: {
-                                        text: String(count),
-                                        x,
-                                        y: y + CELL_SIZE / 2 - 20 - 2,
-                                        align: 'center',
-                                        fill: '#000',
-                                        textFont: api.font({ fontSize: 16, fontWeight: 'bold' }),
-                                        textShadowBlur: 3,
-                                        textShadowColor: '#eee'
-                                    }
-                                } as const : null,
-                                {
-                                    type: 'text',
-                                    style: {
-                                        x: x - CELL_SIZE / 2 + 2,
-                                        y: y - CELL_SIZE / 2 + 2,
-                                        text: day,
-                                        fill: '#000',
-                                        textFont: api.font({ fontSize: 16 })
-                                    }
-                                } as const
-                            ].filter(child => child !== null)
+                            children: children.filter(child => child !== null)
                         }
                     },
                     dimensions: [
