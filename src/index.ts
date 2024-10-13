@@ -124,8 +124,12 @@ export interface RepeatDay {
     gid: string
     month: string
     day: string
-    topSenderId: string
-    topSenderCount: number
+    topRepeaterId: string
+    topRepeaterCount: number
+    topStarterId: string
+    topStarterCount: number
+    topInterrupterId: string
+    topInterrupterCount: number
 }
 
 export async function apply(ctx: Context, config: Config) {
@@ -159,8 +163,12 @@ export async function apply(ctx: Context, config: Config) {
         gid: 'string',
         month: 'string',
         day: 'string',
-        topSenderId: 'string',
-        topSenderCount: 'unsigned'
+        topRepeaterId: 'string',
+        topRepeaterCount: 'unsigned',
+        topStarterId: 'string',
+        topStarterCount: 'unsigned',
+        topInterrupterId: 'string',
+        topInterrupterCount: 'unsigned'
     }, {
         primary: [ 'gid', 'month', 'day' ]
     })
@@ -178,8 +186,8 @@ export async function apply(ctx: Context, config: Config) {
 
     // 工具函数
     // String
-    const ellipsis = (input: string, maxLength: number): string => {
-        const els = h.parse(input)
+    const ellipsis = (s: string, maxLength: number): string => {
+        const els = h.parse(s)
         let length = 0
         let output = ''
         for (const el of els) {
@@ -196,6 +204,9 @@ export async function apply(ctx: Context, config: Config) {
         }
         return output
     }
+
+    const capitalize = <S extends string>(s: S): Capitalize<S> =>
+        (s[0].toUpperCase() + s.slice(1)) as any
 
     const timeText = (time: number) => dayjs(time).format('YYYY/MM/DD HH:mm:ss')
 
@@ -233,6 +244,21 @@ export async function apply(ctx: Context, config: Config) {
         const xOmit = {} as Omit<T, K>
         Object.keys(x).forEach(k => (keys.includes(k as any) ? xPick : xOmit)[k] = x[k])
         return [ xPick, xOmit ]
+    }
+
+    const safeInc = <K extends keyof any>(o: Record<K, number>) => (k: K) => {
+        o[k] ??= 0
+        o[k] ++
+    }
+
+    // Promise
+    const unzipPromise = async <T, U>(p: Promise<readonly [T, U][]>) => {
+        const xs: T[] = [], ys: U[] = []
+        for (const [ x, y ] of await p) {
+            xs.push(x)
+            ys.push(y)
+        }
+        return [ xs, ys ] as const
     }
 
     // Date
@@ -920,10 +946,23 @@ export async function apply(ctx: Context, config: Config) {
     ctx.command('repeat.graph.top-calendar', '查看群复读排行日历')
         .alias('repeat.graph.topc')
         .option('guild', '-g <guild:channel> 指定群（默认为本群）')
+        .option('type', '-t <type> 排行榜类型，可以为 s(tarter) / r(epeater) / i(nterrupter)，默认为 repeater', {
+            type: /^(s|starter|r|repeater|i|interrupter)$/,
+            fallback: 'starter'
+        })
         .option('avatar', '-a 使用头像', { fallback: true })
         .option('avatar', '-A 不使用头像', { value: false })
         .action(async ({ session, options }) => {
             if (! ctx.echarts) return '此指令需要 echarts 服务'
+
+            const topType = ({
+                starter: 'starter',
+                s: 'starter',
+                repeater: 'repeater',
+                r: 'repeater',
+                interrupter: 'interrupter',
+                i: 'interrupter'
+            } as const)[options.type]
 
             if (! session.guildId && ! options.guild) return '请在群内调用'
             const gid = options.guild ?? session.gid
@@ -932,16 +971,30 @@ export async function apply(ctx: Context, config: Config) {
             const days = getDaysOfMonth(date)
             const month = date.format('YYYY-MM')
             const today = date.format('DD')
-            const dataExists = await ctx.database.get('w-repeat-calendar', {
-                month: 'YYYY-MM',
-                day: { $ne: today }
-            })
+
+            const idKey = `top${capitalize(topType)}Id` as const
+            const countKey = `top${capitalize(topType)}Count` as const
+
+            const dataExists = await ctx.database
+                .select('w-repeat-calendar')
+                .where({
+                    month: 'YYYY-MM',
+                    day: { $ne: today },
+                    [idKey]: { $ne: null }
+                })
+                .project({
+                    month: row => row.month,
+                    day: row => row.day,
+                    id: row => row[idKey],
+                    count: row => row[countKey]
+                })
+                .execute()
             const missingDays = exclude(days, dataExists.map(rec => rec.month))
 
             let maxCount = 0
-            const [ memberDict, dataToUpsert ] = await Promise.all([
+            const [ memberDict, [ dataCreated, dataToUpsert ] ] = await Promise.all([
                 getMemberDict(session, gid.split(':')[1]),
-                Promise.all(missingDays.map(async day => {
+                unzipPromise(Promise.all(missingDays.map(async day => {
                     const date = dayjs(`${month}-${day}`)
                     const start = + date.startOf('day')
                     const end = + date.endOf('day')
@@ -949,30 +1002,31 @@ export async function apply(ctx: Context, config: Config) {
                         gid,
                         startTime: { $gte: start, $lte: end }
                     })
-                    if (! recs.length) return { month, day }
-                    const senderDict: Record<string, number> = {}
+                    if (! recs.length) return [
+                        { month, day, id: null, count: null },
+                        { month, day }
+                    ]
+                    const candidatorDict: Record<string, number> = {}
+                    const inc = safeInc(candidatorDict)
                     recs.forEach(rec => {
-                        rec.senders.forEach(sender => {
-                            senderDict[sender] ??= 0
-                            senderDict[sender] ++
-                        })
+                        if (topType === 'repeater') rec.senders.forEach(inc)
+                        else if (topType === 'starter') inc(rec.senders[0])
+                        else inc(rec.interrupter)
                     })
-                    const [ [ topSenderId, topSenderCount ] ] = Object
-                        .entries(senderDict)
+                    const [ [ id, count ] ] = Object
+                        .entries(candidatorDict)
                         .sort(([, count1 ], [, count2 ]) => count2 - count1)
-                    if (topSenderCount > maxCount) maxCount = topSenderCount
-                    return {
-                        month,
-                        day,
-                        topSenderId,
-                        topSenderCount
-                    }
-                }))
+                    if (count > maxCount) maxCount = count
+                    return [
+                        { month, day, id, count },
+                        { month, day, [idKey]: id, [countKey]: count }
+                    ] as const
+                })))
             ])
 
             ctx.database.upsert('w-repeat-calendar', () => dataToUpsert)
             
-            const data = [ ...dataExists, ...dataToUpsert ]
+            const data = [ ...dataExists, ...dataCreated ]
 
             const CELL_SIZE = 80
 
@@ -1065,13 +1119,19 @@ export async function apply(ctx: Context, config: Config) {
                         { name: 'id', type: 'ordinal' },
                         { name: 'count', type: 'int' }
                     ],
-                    data: data.map(({ day, topSenderId, topSenderCount }) =>
-                        [ undefined, day, topSenderId, topSenderCount ]
-                    ),
+                    data: data.map(({ day, id, count }) =>
+                        [ undefined, day, id, count ]
+                    )
                 }
             })
 
-            return eh.export()
+            const topText = ({
+                starter: '发起者',
+                repeater: '参与者',
+                interrupter: '打断者'
+            } satisfies Record<typeof topType, string>)[topType]
+
+            return `本月群${topText}排行榜：\n` + await eh.export()
         })
 
     ctx.command('repeat.record <id:posint>', '查看某次复读详情')
