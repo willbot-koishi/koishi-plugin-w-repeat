@@ -617,6 +617,7 @@ export async function apply(ctx: Context, config: Config) {
         .option('list', '-L 不显示复读记录列表', { value: false })
         .option('top', '-t <top:natural> 排行榜人数', { fallback: 1 })
         .option('filter', '-f <content:string> 根据查找复读记录', requireList())
+        .option('image', '-i 查找包含图片的复读记录', requireList())
         .option('starter', '--us <user:user> 根据发起者查找（默认为自己）', requireList())
         .option('repeater', '--ur <user:user> 根据参与者查找（默认为自己）', requireList())
         .option('interrupter', '--ui <user:user> 根据打断者查找（默认为自己）', requireList())
@@ -659,6 +660,9 @@ export async function apply(ctx: Context, config: Config) {
                         : true,
                     options.interrupter
                         ? $.eq(row.interrupter, options.interrupter)
+                        : true,
+                    options.image
+                        ? $.gt($.length(row.images), 0)
                         : true
                 )))
                 .project({
@@ -719,6 +723,7 @@ export async function apply(ctx: Context, config: Config) {
                 options.starter && `由 ${ getMemberName(memberDict, options.starter) } 发起的`,
                 options.repeater && `有 ${ getMemberName(memberDict, options.repeater) } 参与的`,
                 options.interrupter && `被 ${ getMemberName(memberDict, options.interrupter) } 打断的`,
+                options.image && '包含图片的',
                 options.filter && `符合 /${options.filter}/ 的`,
                 jsfilter && `符合 \`${jsfilter}\``
             ].filter(s => s).join('、')
@@ -736,7 +741,6 @@ export async function apply(ctx: Context, config: Config) {
                     const times = ` * ${rec.senders.length}`
                     const extra =
                         sortMethod === 'tps' ? `, ${rec.tps.toFixed(2)}/s` :
-                        // sortMethod === 'length' ? `, ${rec.length}ch` :
                         ''
                     return `${i + 1}. [${content}${times}${extra}] # ${rec.id}`
                 })
