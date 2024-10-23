@@ -1111,7 +1111,7 @@ export async function apply(ctx: Context, config: Config) {
                                         y: y - CELL_SIZE / 2 + 4,
                                         width: CELL_SIZE - 8,
                                         height: CELL_SIZE - 8,
-                                        image: memberDict[id].user.avatar,
+                                        image: memberDict[id]?.user?.avatar,
                                         shadowColor: '#73b9bc',
                                         shadowBlur: day === today ? 4 : 0,
                                     }
