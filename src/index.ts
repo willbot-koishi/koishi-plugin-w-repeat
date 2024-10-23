@@ -5,7 +5,8 @@ import {
     Fragment,
     Dict,
     Selection,
-    Awaitable
+    Awaitable,
+    Update
 } from 'koishi'
 import { type GuildMember } from '@satorijs/protocol'
 
@@ -13,10 +14,12 @@ import {} from '@koishijs/plugin-help'
 import {} from 'koishi-plugin-w-option-conflict'
 import {} from 'koishi-plugin-w-echarts'
 import {} from 'koishi-plugin-w-tesseract'
+import {} from 'koishi-plugin-w-node'
 
 import dedent from 'dedent'
-import dayjs, { Dayjs } from 'dayjs'
+import dayjs, { type Dayjs } from 'dayjs'
 import format from 'pretty-format'
+import type Jieba from '@node-rs/jieba'
 
 import { botRepeat } from './botRepeat'
 
@@ -24,7 +27,7 @@ export const name = 'w-repeat'
 
 export const inject = {
     required: [ 'database' ],
-    optional: [ 'echarts', 'tesseract' ]
+    optional: [ 'echarts', 'tesseract', 'node' ]
 }
 
 export interface Config {
@@ -71,6 +74,7 @@ export interface RepeatImage {
 export interface RepeatMessage {
     content?: string
     images?: RepeatImage[]
+    words?: { tag: string, word: string }
 }
 
 export interface RepeatRecordBase extends RepeatMessage {
@@ -173,16 +177,41 @@ export async function apply(ctx: Context, config: Config) {
         primary: [ 'gid', 'month', 'day' ]
     })
 
-    // 初始化 tesseract Worker
+    // 定义 Tesseract 初始化
 
-    let tesseractWorker = undefined
+    let tesseractWorker: Tesseract.Worker = undefined
     const initTesseract = async () => {
-        if (! config.doOcr) return
-        const { ocrLangs } = config 
-        await ctx.tesseract.installNecessaryLangs(ocrLangs)
-        tesseractWorker = await ctx.tesseract.createWorker(ocrLangs)
+        try {
+            const { ocrLangs } = config 
+            await ctx.tesseract.installNecessaryLangs(ocrLangs)
+            tesseractWorker = await ctx.tesseract.createWorker(ocrLangs)
+            ctx.logger.success('Inited Tesseract.')
+        }
+        catch (error) {
+            ctx.logger.info('Failed to init Tesseract: %o', error)
+        }
     }
-    await initTesseract()
+
+    // 定义 Jieba 初始化
+
+    let jieba: typeof Jieba = undefined
+    const initJieba = async () => {
+        try {
+            jieba = await ctx.node.safeImport<typeof Jieba>('@node-rs/jieba')
+            jieba.load()
+            ctx.logger.success('Inited Jieba.')
+        }
+        catch (error) {
+            ctx.logger.info('Failed to init Jieba: %o', error)
+        }
+    }
+
+    // 等待所有初始化完成
+
+    await Promise.all([
+        initTesseract(),
+        initJieba()
+    ])
 
     // 工具函数
     // String
@@ -299,9 +328,9 @@ export async function apply(ctx: Context, config: Config) {
         const res = await fn()
         const time = Date.now() - start
         return `${res ?? ''}\n\n用时 ${time > 2000
-                ? (time * .001).toFixed(3) + 's'
-                : time.toFixed(3) + 'ms'
-            }`
+            ? (time * .001).toFixed(3) + 's'
+            : time.toFixed(3) + 'ms'
+        }`
     }
 
     // Database
@@ -950,23 +979,14 @@ export async function apply(ctx: Context, config: Config) {
     ctx.command('repeat.graph.top-calendar', '查看群复读排行日历')
         .alias('repeat.graph.topc')
         .option('guild', '-g <guild:channel> 指定群（默认为本群）')
-        .option('type', '-t <type> 排行榜类型，可以为 s(tarter) / r(epeater) / i(nterrupter)，默认为 repeater', {
-            type: /^(s|starter|r|repeater|i|interrupter)$/,
-            fallback: 'starter'
+        .option('type', '-t <type> 排行榜类型，可以为 r(epeater) / (s)tarter / i(nterrupter) / a(ll)，默认为 repeater', {
+            type: /^(r|repeater|s|starter|i|interrupter|a|all)$/,
+            fallback: 'repeater'
         })
         .option('avatar', '-a 使用头像', { fallback: true })
         .option('avatar', '-A 不使用头像', { value: false })
         .action(async ({ session, options }) => {
             if (! ctx.echarts) return '此指令需要 echarts 服务'
-
-            const topType = ({
-                starter: 'starter',
-                s: 'starter',
-                repeater: 'repeater',
-                r: 'repeater',
-                interrupter: 'interrupter',
-                i: 'interrupter'
-            } as const)[options.type]
 
             if (! session.guildId && ! options.guild) return '请在群内调用'
             const gid = options.guild ?? session.gid
@@ -976,166 +996,201 @@ export async function apply(ctx: Context, config: Config) {
             const month = date.format('YYYY-MM')
             const today = date.format('DD')
 
-            const idKey = `top${capitalize(topType)}Id` as const
-            const countKey = `top${capitalize(topType)}Count` as const
-
-            const dataExists = await ctx.database
-                .select('w-repeat-calendar')
-                .where({
-                    month: 'YYYY-MM',
-                    day: { $ne: today },
-                    [idKey]: { $ne: null }
-                })
-                .project({
-                    month: row => row.month,
-                    day: row => row.day,
-                    id: row => row[idKey],
-                    count: row => row[countKey]
-                })
-                .execute()
-            const missingDays = exclude(days, dataExists.map(rec => rec.month))
-
-            let maxCount = 0
-            const [ memberDict, [ dataCreated, dataToUpsert ] ] = await Promise.all([
-                getMemberDict(session, gid.split(':')[1]),
-                unzipPromise(Promise.all(missingDays.map(async day => {
-                    const date = dayjs(`${month}-${day}`)
-                    const start = + date.startOf('day')
-                    const end = + date.endOf('day')
-                    const recs = await ctx.database.get('w-repeat-record', {
-                        gid,
-                        startTime: { $gte: start, $lte: end }
-                    })
-                    if (! recs.length) return [
-                        { month, day, id: null, count: null },
-                        { month, day }
-                    ]
-                    const candidatorDict: Record<string, number> = {}
-                    const inc = safeInc(candidatorDict)
-                    recs.forEach(rec => {
-                        if (topType === 'repeater') rec.senders.forEach(inc)
-                        else if (topType === 'starter') inc(rec.senders[0])
-                        else inc(rec.interrupter)
-                    })
-                    const [ [ id, count ] ] = Object
-                        .entries(candidatorDict)
-                        .sort(([, count1 ], [, count2 ]) => count2 - count1)
-                    if (count > maxCount) maxCount = count
-                    return [
-                        { month, day, id, count },
-                        { month, day, [idKey]: id, [countKey]: count }
-                    ] as const
-                })))
-            ])
-
-            ctx.database.upsert('w-repeat-calendar', () => dataToUpsert)
-            
-            const data = [ ...dataExists, ...dataCreated ]
-
-            const CELL_SIZE = 80
-
-            const eh = ctx.echarts.createChart(700, 500, {
-                backgroundColor: '#fff',
-                calendar: {
-                    orient: 'vertical',
-                    yearLabel: {
-                        show: false
-                    },
-                    monthLabel: {
-                        nameMap: 'cn',
-                        margin: 20,
-                        fontSize: 20,
-                        fontWeight: 600
-                    },
-                    dayLabel: {
-                        nameMap: [ 'Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat' ],
-                        firstDay: 1,
-                        margin: 20,
-                        fontSize: 17
-                    },
-                    cellSize: CELL_SIZE,
-                    range: month
-                },
-                visualMap: {
-                    min: 0,
-                    max: maxCount,
-                    calculable: true,
-                    show: false
-                },
-                series: {
-                    type: 'custom',
-                    coordinateSystem: 'calendar',
-                    renderItem: (_, api) => {
-                        const day = api.value('day') as string
-                        const id = api.value('id') as string
-                        const count = api.value('count') as number
-                        const [ x, y ] = api.coord(`${month}-${day}`)
-                        
-                        type CustomSeriesOption = echarts.RegisteredSeriesOption['custom']
-                        type CustomGroupOption = ReturnType<CustomSeriesOption['renderItem']> & { type: 'group' }
-
-                        const children: CustomGroupOption['children'] = [
-                            id ? {
-                                type: 'image',
-                                style: {
-                                    x: x - CELL_SIZE / 2 + 4,
-                                    y: y - CELL_SIZE / 2 + 4,
-                                    width: CELL_SIZE - 8,
-                                    height: CELL_SIZE - 8,
-                                    image: memberDict[id].user.avatar,
-                                    shadowColor: '#73b9bc',
-                                    shadowBlur: day === today ? 4 : 0,
-                                }
-                            } : null,
-                            id ? {
-                                type: 'text',
-                                style: {
-                                    text: String(count),
-                                    x,
-                                    y: y + CELL_SIZE / 2 - 20 - 2,
-                                    align: 'center',
-                                    fill: '#000',
-                                    stroke: '#fff',
-                                    lineWidth: 2,
-                                    textFont: api.font({ fontSize: 16, fontWeight: 'bold' })
-                                }
-                            } : null,
-                            {
-                                type: 'text',
-                                style: {
-                                    x: x - CELL_SIZE / 2 + 2,
-                                    y: y - CELL_SIZE / 2 + 2,
-                                    text: day,
-                                    fill: '#000',
-                                    textFont: api.font({ fontSize: 16 })
-                                }
-                            }
-                        ]
-
-                        return {
-                            type: 'group',
-                            children: children.filter(child => child !== null)
-                        }
-                    },
-                    dimensions: [
-                        undefined,
-                        { name: 'day', type: 'ordinal' },
-                        { name: 'id', type: 'ordinal' },
-                        { name: 'count', type: 'int' }
-                    ],
-                    data: data.map(({ day, id, count }) =>
-                        [ undefined, day, id, count ]
-                    )
-                }
-            })
-
-            const topText = ({
+            type TopType = 'repeater' | 'starter' | 'interrupter'
+            const topTypeText = {
                 starter: '发起者',
                 repeater: '参与者',
                 interrupter: '打断者'
-            } satisfies Record<typeof topType, string>)[topType]
+            } satisfies Record<TopType, string>
 
-            return `本月群${topText}排行榜：\n` + await eh.export()
+            const getCalendar = async (topType: TopType): Promise<{
+                output: string,
+                dataToUpsert: Update<RepeatDay>[]
+            }> => {
+                const idKey = `top${capitalize(topType)}Id` as const
+                const countKey = `top${capitalize(topType)}Count` as const
+
+                const dataExists = await ctx.database
+                    .select('w-repeat-calendar')
+                    .where({
+                        month: 'YYYY-MM',
+                        day: { $ne: today },
+                        [idKey]: { $ne: null }
+                    })
+                    .project({
+                        month: row => row.month,
+                        day: row => row.day,
+                        id: row => row[idKey],
+                        count: row => row[countKey]
+                    })
+                    .execute()
+                const missingDays = exclude(days, dataExists.map(rec => rec.month))
+
+                let maxCount = 0
+                const [ memberDict, [ dataCreated, dataToUpsert ] ] = await Promise.all([
+                    getMemberDict(session, gid.split(':')[1]),
+                    unzipPromise(Promise.all(missingDays.map(async day => {
+                        const date = dayjs(`${month}-${day}`)
+                        const start = + date.startOf('day')
+                        const end = + date.endOf('day')
+                        const recs = await ctx.database.get('w-repeat-record', {
+                            gid,
+                            startTime: { $gte: start, $lte: end }
+                        })
+                        if (! recs.length) return [
+                            { month, day, id: null, count: null },
+                            { month, day }
+                        ]
+                        const candidatorDict: Record<string, number> = {}
+                        const inc = safeInc(candidatorDict)
+                        recs.forEach(rec => {
+                            if (topType === 'repeater') rec.senders.forEach(inc)
+                            else if (topType === 'starter') inc(rec.senders[0])
+                            else inc(rec.interrupter)
+                        })
+                        const [ [ id, count ] ] = Object
+                            .entries(candidatorDict)
+                            .sort(([, count1 ], [, count2 ]) => count2 - count1)
+                        if (count > maxCount) maxCount = count
+                        return [
+                            { month, day, id, count },
+                            { month, day, [idKey]: id, [countKey]: count }
+                        ] as const
+                    })))
+                ])
+
+                const data = [ ...dataExists, ...dataCreated ]
+
+                const CELL_SIZE = 80
+
+                const eh = ctx.echarts.createChart(700, 500, {
+                    backgroundColor: '#fff',
+                    calendar: {
+                        orient: 'vertical',
+                        yearLabel: {
+                            show: false
+                        },
+                        monthLabel: {
+                            nameMap: 'cn',
+                            margin: 20,
+                            fontSize: 20,
+                            fontWeight: 600
+                        },
+                        dayLabel: {
+                            nameMap: [ 'Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat' ],
+                            firstDay: 1,
+                            margin: 20,
+                            fontSize: 17
+                        },
+                        cellSize: CELL_SIZE,
+                        range: month
+                    },
+                    visualMap: {
+                        min: 0,
+                        max: maxCount,
+                        calculable: true,
+                        show: false
+                    },
+                    series: {
+                        type: 'custom',
+                        coordinateSystem: 'calendar',
+                        renderItem: (_, api) => {
+                            const day = api.value('day') as string
+                            const id = api.value('id') as string
+                            const count = api.value('count') as number
+                            const [ x, y ] = api.coord(`${month}-${day}`)
+                            
+                            type CustomSeriesOption = echarts.RegisteredSeriesOption['custom']
+                            type CustomGroupOption = ReturnType<CustomSeriesOption['renderItem']> & { type: 'group' }
+
+                            const children: CustomGroupOption['children'] = [
+                                id ? {
+                                    type: 'image',
+                                    style: {
+                                        x: x - CELL_SIZE / 2 + 4,
+                                        y: y - CELL_SIZE / 2 + 4,
+                                        width: CELL_SIZE - 8,
+                                        height: CELL_SIZE - 8,
+                                        image: memberDict[id].user.avatar,
+                                        shadowColor: '#73b9bc',
+                                        shadowBlur: day === today ? 4 : 0,
+                                    }
+                                } : null,
+                                id ? {
+                                    type: 'text',
+                                    style: {
+                                        text: String(count),
+                                        x,
+                                        y: y + CELL_SIZE / 2 - 20 - 2,
+                                        align: 'center',
+                                        fill: '#000',
+                                        stroke: '#fff',
+                                        lineWidth: 2,
+                                        textFont: api.font({ fontSize: 16, fontWeight: 'bold' })
+                                    }
+                                } : null,
+                                {
+                                    type: 'text',
+                                    style: {
+                                        x: x - CELL_SIZE / 2 + 2,
+                                        y: y - CELL_SIZE / 2 + 2,
+                                        text: day,
+                                        fill: '#000',
+                                        textFont: api.font({ fontSize: 16 })
+                                    }
+                                }
+                            ]
+
+                            return {
+                                type: 'group',
+                                children: children.filter(child => child !== null)
+                            }
+                        },
+                        dimensions: [
+                            undefined,
+                            { name: 'day', type: 'ordinal' },
+                            { name: 'id', type: 'ordinal' },
+                            { name: 'count', type: 'int' }
+                        ],
+                        data: data.map(({ day, id, count }) =>
+                            [ undefined, day, id, count ]
+                        )
+                    }
+                })
+
+                const topText = topTypeText[topType]
+
+                return {
+                    output: `本月群${topText}排行榜：\n` + await eh.export(),
+                    dataToUpsert
+                }
+            }
+
+            // TODO: Optimize
+            if (options.type === 'a' || options.type === 'all') {
+                const outputs = await Promise.all(Array<TopType>('repeater', 'starter', 'interrupter')
+                    .map(async (topType) => {
+                        const { output, dataToUpsert } = await getCalendar(topType)
+                        await ctx.database.upsert('w-repeat-calendar', dataToUpsert)
+                        return output
+                    })
+                )
+                const output = h('message', { forward: true }, outputs.map(output => h('message', h.parse(output))))
+                return output
+            }
+
+            const topType = ({
+                repeater: 'repeater',
+                r: 'repeater',
+                starter: 'starter',
+                s: 'starter',
+                interrupter: 'interrupter',
+                i: 'interrupter'
+            } as const)[options.type]
+
+            const { output, dataToUpsert } = await getCalendar(topType)
+            await ctx.database.upsert('w-repeat-calendar', dataToUpsert)
+            return output
         })
 
     ctx.command('repeat.record <id:posint>', '查看某次复读详情')
