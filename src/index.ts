@@ -14,12 +14,10 @@ import {} from '@koishijs/plugin-help'
 import {} from 'koishi-plugin-w-option-conflict'
 import {} from 'koishi-plugin-w-echarts'
 import {} from 'koishi-plugin-w-tesseract'
-import {} from 'koishi-plugin-w-node'
+import { type Jieba, type Tag } from 'koishi-plugin-w-jieba'
 
 import dedent from 'dedent'
 import dayjs, { type Dayjs } from 'dayjs'
-import format from 'pretty-format'
-import type Jieba from '@node-rs/jieba'
 
 import { botRepeat } from './botRepeat'
 
@@ -27,7 +25,7 @@ export const name = 'w-repeat'
 
 export const inject = {
     required: [ 'database' ],
-    optional: [ 'echarts', 'tesseract', 'node' ]
+    optional: [ 'echarts', 'tesseract', 'jieba' ]
 }
 
 export interface Config {
@@ -37,9 +35,12 @@ export interface Config {
     imageTextDisplayLength: number
     displayPageSize: number
     repeatBlacklist: string[]
-    doProcessImage: boolean
-    doOcr: boolean
+    doProceedImage: boolean
+    enableOcr: boolean
     ocrLangs: string[]
+    enableSegmentation: boolean
+    segmentationWordBlacklist: string[]
+    segmentationTagBlacklist: string[]
     doWrite: boolean
 }
 
@@ -50,11 +51,14 @@ export const Config: z<Config> = z.object({
     imageTextDisplayLength: z.natural().default(15).description('图片文字预览最大长度，超过则显示为省略号'),
     displayPageSize: z.natural().min(5).default(10).description('复读消息分页大小，至少为 5'),
     repeatBlacklist: z.array(z.string()).description('复读内容黑名单'),
-    doProcessImage: z.boolean().default(false).description('是否处理图片（会使用较多数据库空间）'),
-    doOcr: z.boolean().default(true).description('是否自动识别复读消息图片中文字'),
+    doProceedImage: z.boolean().default(false).description('是否处理图片（会使用较多数据库空间）'),
+    enableOcr: z.boolean().default(true).description('是否自动识别复读消息图片中文字'),
     ocrLangs: z.array(z.string()).default([ 'chi_sim', 'eng' ]).description('识别图片中文字时尝试的语言，参考 ' +
         '<https://tesseract-ocr.github.io/tessdoc/Data-Files#data-files-for-version-400-november-29-2016>'
     ),
+    enableSegmentation: z.boolean().default(true).description('是否对复读消息分词'),
+    segmentationWordBlacklist: z.array(z.string()).description('复读词频统计中不显示的词'),
+    segmentationTagBlacklist: z.array(z.string()).description('复读词频统计中不显示的词性'),
     doWrite: z.boolean().default(true).description('是否向数据库写入复读数据')
 })
 
@@ -63,6 +67,7 @@ declare module 'koishi' {
         'w-repeat-record': RepeatRecord         // 复读记录表
         'w-repeat-user': RepeatUser             // 复读用户表
         'w-repeat-calendar': RepeatDay          // 复读日历
+        'w-repeat-word': RepeatWord             // 复读分词表
     }
 }
 
@@ -74,7 +79,7 @@ export interface RepeatImage {
 export interface RepeatMessage {
     content?: string
     images?: RepeatImage[]
-    words?: { tag: string, word: string }
+    words?: Tag[]
 }
 
 export interface RepeatRecordBase extends RepeatMessage {
@@ -136,18 +141,56 @@ export interface RepeatDay {
     topInterrupterCount: number
 }
 
+export interface RepeatWord {
+    gid: string
+    word: string
+    tag: string
+    count: number
+}
+
 export async function apply(ctx: Context, config: Config) {
     // 扩展数据库模型
     ctx.model.extend('w-repeat-record', {
         id: 'unsigned',
         gid: 'string',
-        content: 'string',
-        senders: 'array',
+        content: 'text',
+        senders: {
+            type: 'array',
+            inner: 'string'
+        },
         startTime: 'unsigned',
         endTime: 'unsigned',
         interrupter: 'string',
-        images: 'array',
-        suspensions: 'array'
+        images: {
+            type: 'array',
+            inner: {
+                type: 'object',
+                inner: {
+                    text: 'string',
+                    b64: 'string'
+                }
+            }
+        },
+        words: {
+            type: 'array',
+            inner: {
+                type: 'object',
+                inner: {
+                    tag: 'string',
+                    word: 'string'
+                }
+            }
+        },
+        suspensions: {
+            type: 'array',
+            inner: {
+                type: 'object',
+                inner: {
+                    suspendTime: 'unsigned',
+                    resumeTime: 'unsigned'
+                }
+            }
+        }
     }, { autoInc: true })
 
     const counterField = () => ({
@@ -177,6 +220,15 @@ export async function apply(ctx: Context, config: Config) {
         primary: [ 'gid', 'month', 'day' ]
     })
 
+    ctx.model.extend('w-repeat-word', {
+        gid: 'string',
+        word: 'string',
+        tag: 'string',
+        count: 'unsigned'
+    }, {
+        primary: [ 'gid', 'word', 'tag' ]
+    })
+
     // 定义 Tesseract 初始化
 
     let tesseractWorker: Tesseract.Worker = undefined
@@ -194,11 +246,10 @@ export async function apply(ctx: Context, config: Config) {
 
     // 定义 Jieba 初始化
 
-    let jieba: typeof Jieba = undefined
+    let jieba: Jieba = undefined
     const initJieba = async () => {
         try {
-            jieba = await ctx.node.safeImport<typeof Jieba>('@node-rs/jieba')
-            jieba.load()
+            jieba = new ctx.jieba.Jieba
             ctx.logger.success('Inited Jieba.')
         }
         catch (error) {
@@ -238,6 +289,13 @@ export async function apply(ctx: Context, config: Config) {
         (s[0].toUpperCase() + s.slice(1)) as any
 
     const timeText = (time: number) => dayjs(time).format('YYYY/MM/DD HH:mm:ss')
+
+    const splitWithLimit = (s: string, delimiter: string, limit: number) => {
+        const segs = s.split(delimiter)
+        const initSegs = segs.slice(0, limit - 1)
+        const lastSeg = segs.slice(limit - 1).join(delimiter)
+        return [ ...initSegs, lastSeg ]
+    }
 
     // Array
     const maybeArray = <T>(x: T | T[]): T[] => Array.isArray(x) ? x : [ x ]
@@ -307,10 +365,10 @@ export async function apply(ctx: Context, config: Config) {
     // Adapter
     const getMemberDict = async (session: Session, guildId: string) => {
         const { data: memberList } = await session.bot.getGuildMemberList(guildId)
-        return memberList.reduce<Record<string, GuildMember>>((dict, member) => {
+        const dict: Record<string, GuildMember> = {}
+        for (const member of memberList)
             dict[`${session.platform}:${member.user.id}`] = member
-            return dict
-        }, {})
+        return dict
     }
 
     const getMemberName = (memberDict: Record<string, GuildMember>, uid: string) => {
@@ -394,6 +452,23 @@ export async function apply(ctx: Context, config: Config) {
         if ('id' in rec) await ctx.database.set('w-repeat-record', { id: rec.id }, { images })
     }
 
+    const updateWords = async (rec: RepeatRecord | RepeatQueuedRecord) => {
+        const text = h.transform(
+            rec.content.replace(/@__KOISHI_IMG__@/g, ''),
+            el => el.type === 'text' ? el.toString() : ''
+        )
+        const words = rec.words = jieba
+            .tag(text)
+
+        if ('id' in rec) await ctx.database.set(
+            'w-repeat-record',
+            { id: rec.id },
+            { words: words.map(word => $.literal(word)) }
+        )
+
+        return words
+    }
+
     const createCurrentRec = (gid: string): RepeatQueuedRecord => ({
         gid,
         content: undefined,
@@ -411,15 +486,19 @@ export async function apply(ctx: Context, config: Config) {
         { allowImage = true }: { allowImage?: boolean } = {}
     ): string => {
         let imageIdx = 0
-        return message.content.replace(
+        let content = message.content.replace(
             /@__KOISHI_IMG__@/g,
             () => {
                 const image = message.images[imageIdx ++]
                 return allowImage
                     ? h.img('data:image/png;base64,' + image.b64).toString()
-                    : `[图片${ image.text ? ': ' + image.text : '' }]`
+                    : `[图片${ image.text ? ': ' + image.text.replace(/\s+/g, ' ') : '' }]`
             }
         )
+        content = h.transform(content, {
+            face: () => '[表情]'
+        })
+        return content
     }
 
     // 复读中间件
@@ -441,7 +520,7 @@ export async function apply(ctx: Context, config: Config) {
         const content = h
             .parse(originalContent)
             .map(el => {
-                if (config.doProcessImage && el.type === 'img') {
+                if (config.doProceedImage && el.type === 'img') {
                     const src = el.attrs.src as string
                     imageSrcs.push(src)
                     return '@__KOISHI_IMG__@'
@@ -577,7 +656,9 @@ export async function apply(ctx: Context, config: Config) {
                         interruptTime: $inc(row.interruptTime)
                     }]),
                     // 识别图片中文字
-                    (config.doProcessImage && config.doOcr && tesseractWorker) ? updateImageText(currentRec) : undefined
+                    (config.enableOcr && tesseractWorker) ? updateImageText(currentRec) : undefined,
+                    // 分词
+                    (config.enableSegmentation && jieba) ? updateWords(currentRec) : undefined
                 ])
 
                 // 如果允许挂起，挂起被打断的复读
@@ -775,7 +856,7 @@ export async function apply(ctx: Context, config: Config) {
                 })
                 .join('\n')
 
-            return (options.list
+            const text = (options.list
                 ? dedent`
                     ${groupText}${durationText}共有 ${recs.length} 次${filterText}复读
                     按${sortMethodText}${sortDirectionText}排序依次为：（第 ${pageId} / ${pageNum} 页）
@@ -790,6 +871,85 @@ export async function apply(ctx: Context, config: Config) {
                 `
                 : ''
             )
+
+            return text
+        })
+    
+    ctx.command('repeat.word', '查看群复读词频统计')
+        .alias('repeat.w')
+
+    ctx.command('repeat.word.word', '查看群内最常被复读的词')
+        .option('guild', '-g <guild:channel> 指定群（默认为本群）', {
+            conflictsWith: { option: 'global', value: true }
+        })
+        .option('global', '-G 指定群（默认为本群）')
+        .option('top', '-t <top:natural>', { fallback: 20 })
+        .option('tag', '-T <tag:string>')
+        .option('all', '-a 显示所有词（包括黑名单中的）')
+        .action(async ({
+            session: { guildId, gid },
+            options: { guild: assignedGid, global: isGlobal, top: topCount, all, tag: tagStr }
+        }) => {
+            if (! guildId && ! assignedGid && ! isGlobal) return '请在群内调用'
+            if (assignedGid) gid = assignedGid
+
+            const tags = tagStr ? tagStr.split(',') : null
+
+            const words = await ctx.database
+                .select('w-repeat-word')
+                .where({
+                    gid: isGlobal ? {} : gid,
+                    word: all ? {} : { $not: { $in: config.segmentationWordBlacklist } },
+                    tag: {
+                        $and: [
+                            all ? {} : { $not: { $in: config.segmentationWordBlacklist } },
+                            tags ? { $in: tags } : {}
+                        ]
+                    }
+                })
+                .orderBy('count', 'desc')
+                .limit(topCount)
+                .execute()
+            
+            const filterText = tags
+                ? `词性为 ${tags.join(' | ')} 的`
+                : ''
+
+            const wordsText = words
+                .map(({ word, tag, count }, index) => `${index + 1}. ${word} [${tag}]: ${count}`)
+                .join('\n')
+
+            return `群内最经常被复读的${filterText} ${topCount} 个词是：\n\n${wordsText}`
+        })
+
+    ctx.command('repeat.word.tag', '查看群内最常被复读的词性')
+        .option('guild', '-g <guild:channel> 指定群（默认为本群）', {
+            conflictsWith: { option: 'global', value: true }
+        })
+        .option('global', '-G 指定群（默认为本群）')
+        .option('top', '-t <top:natural>', { fallback: 20 })
+        .option('all', '-a 显示所有词（包括黑名单中的）')
+        .action(async ({
+            session: { guildId, gid },
+            options: { guild: assignedGid, global: isGlobal, top: topCount }
+        }) => {
+            if (! guildId && ! assignedGid && ! isGlobal) return '请在群内调用'
+            if (assignedGid) gid = assignedGid
+
+            const tags = await ctx.database
+                .select('w-repeat-word')
+                .groupBy('tag', {
+                    count: row => $.sum(row.count)
+                })
+                .orderBy('count', 'desc')
+                .limit(topCount)
+                .execute()
+
+            const tagsText = tags
+                .map(({ tag, count }, index) => `${index + 1}. ${tag}: ${count}`)
+                .join('\n')
+
+            return `群内最经常被复读的 ${topCount} 个词性是：\n\n${tagsText}`
         })
 
     ctx.command('repeat.graph', '查看复读相关图表')
@@ -1168,7 +1328,7 @@ export async function apply(ctx: Context, config: Config) {
 
             // TODO: Optimize
             if (options.type === 'a' || options.type === 'all') {
-                const outputs = await Promise.all(Array<TopType>('repeater', 'starter', 'interrupter')
+                const outputs = await Promise.all(([ 'repeater', 'starter', 'interrupter' ] satisfies TopType[])
                     .map(async (topType) => {
                         const { output, dataToUpsert } = await getCalendar(topType)
                         await ctx.database.upsert('w-repeat-calendar', dataToUpsert)
@@ -1199,6 +1359,7 @@ export async function apply(ctx: Context, config: Config) {
         .option('suspension', '-s 显示挂起详情')
         .option('delete', '-d 删除此复读详情', { authority: 4 })
         .option('ocr', '-o 识别图片中文字')
+        .option('segmentation', '--seg 对复读消息分词')
         .action(async ({ session, options }, id) => {
             const [ rec ] = await ctx.database.get('w-repeat-record', { id })
             if (! rec) return `未找到复读 #${id}。`
@@ -1217,7 +1378,11 @@ export async function apply(ctx: Context, config: Config) {
                 content = unescapeMessage(rec)
                 if (options.ocr) {
                     if (tesseractWorker) await updateImageText(rec)
-                    else return 'tesseract 服务未加载，无法识别图片中文字'
+                    else return 'Tesseract 未加载，无法识别图片中文字'
+                }
+                if (options.segmentation) {
+                    if (jieba) await updateWords(rec)
+                    else return 'Jieba 未加载，无法分词'
                 }
             }
 
@@ -1244,14 +1409,18 @@ export async function apply(ctx: Context, config: Config) {
                 参与者：${sendersText}
                 打断时间：${timeText(rec.endTime)}
                 挂起情况：${suspensionText}
-                内容：${options.delete ? '[已删除]' : content}${rec.images.length || options.ocr
+                内容：${options.delete ? '[已删除]' : content}`
+                + (rec.images.length || options.ocr
                     ? `\n图片识别结果：${options.ocr ? '[新识别]' : ''}\n${rec.images
                         .map(({ text }, i) => `${i + 1}. ${text.trim() || '[未识别到文字]'}`)
                         .join('\n')
                     }`
                     : ''
-                }
-            `
+                )
+                + (rec.words
+                    ? `\n分词结果：${rec.words.map(({ word, tag }) => `${word} [${tag}]`).join(', ')}`
+                    : ''
+                )
         })
 
     ctx.command('repeat.debug', '复读调试', { hidden: true })
@@ -1259,15 +1428,17 @@ export async function apply(ctx: Context, config: Config) {
     ctx.command('repeat.debug.eval <code:text>', '在本插件作用域中运行 JavaScript', { authority: 4 })
         .action(async (_, code) => {
             try {
-                return format(await eval(code))
+                return JSON.stringify(await eval(code), null, 2)
             }
             catch (error) {
-                return format(error)
+                return String(error)
             }
         })
 
     ctx.command('repeat.debug.runtime', '获取当前复读运行时', { authority: 2 })
-        .action(({ session }) => '当前运行时：\n' + h.escape(format(runtimes[session.gid])))
+        .action(({ session }) => '当前运行时：\n'
+            + h.escape(JSON.stringify(runtimes[session.gid], null, 2))
+        )
 
     ctx.command('repeat.debug.runtime.clear', '清除复读运行时', { authority: 2 })
         .option('all', '-a 清除所有')
@@ -1295,12 +1466,13 @@ export async function apply(ctx: Context, config: Config) {
                 复读配置
                 ====================
                 复读写入：${config.doWrite}
-                处理图片：${config.doProcessImage}
-                自动识别图片：${config.doOcr}
+                处理图片：${config.doProceedImage}
+                自动识别图片：${config.enableOcr}
+                自动分词：${config.enableSegmentation}
                 复读内容黑名单：${config.repeatBlacklist.map(re => `/${re}/`).join(', ')}
             `
         })
-
+        
     ctx.command('repeat.admin.regen-user-table', '重建复读用户表', { authority: 4 })
         .action(async ({ session }) => {
             await session.send('正在根据复读记录重建用户数据表……')
@@ -1336,14 +1508,36 @@ export async function apply(ctx: Context, config: Config) {
             return `已重建 ${writeResult.inserted} 条用户数据`
         })
 
-    ctx.command('repeat.admin.recognize-all-images', '识别所有表中图片', { authority: 4 })
+    ctx.command('repeat.admin.ocr-all', '识别所有消息图片', { authority: 4 })
         .action(({ session }) => profile(async () => {
-            if (! ctx.tesseract) return 'tesseract 服务未加载，无法识别图片中文字'
+            if (! tesseractWorker) return 'Tesseract 未加载，无法识别图片中文字'
             await session.send('开始查询数据库……')
             const recs = await ctx.database.get('w-repeat-record', row => $.gt($.length(row.images), 0))
             const imageCount = recs.reduce((count, rec) => count + rec.images.filter(x => x !== null).length, 0)
             await session.send(`正在识别 ${recs.length} 条复读记录中的 ${imageCount} 张图片……`)
-            await Promise.all(recs.map(rec => updateImageText(rec)))
+            await Promise.all(recs.map(updateImageText))
+        }))
+
+    ctx.command('repeat.admin.segmentation-all', '对所有消息分词', { authority: 4 })
+        .action(({ session }) => profile(async () => {
+            if (! jieba) return 'Jieba 未加载，无法分词'
+            await session.send('正在清空分词表……')
+            await ctx.database.remove('w-repeat-word', {})
+            await session.send('开始查询数据库…… ')
+            const recs = await ctx.database.get('w-repeat-record', {})
+            await session.send(`正在对 ${recs.length} 条复读记录分词……`)
+            const wordDict: Record<string, number> = {}
+            const incWord = safeInc(wordDict)
+            await Promise.all(recs.map(async rec => {
+                const words = await updateWords(rec)
+                words.forEach(({ tag, word }) => incWord(`${rec.gid}#${tag}#${word}`))
+            }))
+            await session.send('正在写入分词表……')
+            const words = Object.entries(wordDict).map(([ gidTagWord, count ]) => {
+                const [ gid, tag, word ] = splitWithLimit(gidTagWord, '#', 3)
+                return { gid, word, tag, count }
+            })
+            await ctx.database.upsert('w-repeat-word', words)
         }))
 
     ctx.command('repeat.admin.migrate-guild <from:channel> <to:channel>', '迁移群复读记录', { authority: 4 })
