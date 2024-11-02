@@ -229,7 +229,7 @@ export async function apply(ctx: Context, config: Config) {
         primary: [ 'gid', 'word', 'tag' ]
     })
 
-    // 定义 Tesseract 初始化
+    // Tesseract 初始化
 
     let tesseractWorker: Tesseract.Worker = undefined
     const initTesseract = async () => {
@@ -244,7 +244,7 @@ export async function apply(ctx: Context, config: Config) {
         }
     }
 
-    // 定义 Jieba 初始化
+    // Jieba 初始化
 
     let jieba: Jieba = undefined
     const initJieba = async () => {
@@ -483,7 +483,13 @@ export async function apply(ctx: Context, config: Config) {
 
     const unescapeMessage = (
         message: RepeatMessage,
-        { allowImage = true }: { allowImage?: boolean } = {}
+        {
+            allowImage = true,
+            allowFace = true
+        }: {
+            allowImage?: boolean,
+            allowFace?: boolean
+        } = {}
     ): string => {
         let imageIdx = 0
         let content = message.content.replace(
@@ -496,7 +502,7 @@ export async function apply(ctx: Context, config: Config) {
             }
         )
         content = h.transform(content, {
-            face: () => '[表情]'
+            face: allowFace ? undefined : () => '[表情]'
         })
         return content
     }
@@ -1136,24 +1142,26 @@ export async function apply(ctx: Context, config: Config) {
             return eh.export()
         })
 
-    ctx.command('repeat.graph.top-calendar', '查看群复读排行日历')
+    ctx.command('repeat.graph.top-calendar [month:string]', '查看群复读排行日历')
         .alias('repeat.graph.topc')
         .option('guild', '-g <guild:channel> 指定群（默认为本群）')
-        .option('type', '-t <type> 排行榜类型，可以为 r(epeater) / (s)tarter / i(nterrupter) / a(ll)，默认为 repeater', {
+        .option('type', '-t <type> 排行榜类型，可以为 r(epeater) / (s)tarter / i(nterrupter) / a(ll)，默认为 all', {
             type: /^(r|repeater|s|starter|i|interrupter|a|all)$/,
-            fallback: 'repeater'
+            fallback: 'all'
         })
         .option('avatar', '-a 使用头像', { fallback: true })
         .option('avatar', '-A 不使用头像', { value: false })
-        .action(async ({ session, options }) => {
+        .action(async ({ session, options }, month) => {
             if (! ctx.echarts) return '此指令需要 echarts 服务'
 
             if (! session.guildId && ! options.guild) return '请在群内调用'
             const gid = options.guild ?? session.gid
 
-            const date = dayjs()
+            const date = month ? dayjs(month, 'YYYY-MM', true) : dayjs()
+            if (! date.isValid()) return `${month} 不是合法的月份，月份格式应为 YYYY-MM`
+            month = date.format('YYYY-MM')
+
             const days = getDaysOfMonth(date)
-            const month = date.format('YYYY-MM')
             const today = date.format('DD')
 
             type TopType = 'repeater' | 'starter' | 'interrupter'
