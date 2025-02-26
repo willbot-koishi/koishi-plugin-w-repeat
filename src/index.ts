@@ -19,8 +19,6 @@ import { type Jieba, type Tag } from 'koishi-plugin-w-jieba'
 import dedent from 'dedent'
 import dayjs, { type Dayjs } from 'dayjs'
 
-import { botRepeat } from './botRepeat'
-
 export const name = 'w-repeat'
 
 export const inject = {
@@ -80,6 +78,11 @@ export interface RepeatMessage {
     content?: string
     images?: RepeatImage[]
     words?: Tag[]
+    quote?: {
+        valid: boolean
+        content?: string
+        id?: string
+    }
 }
 
 export interface RepeatRecordBase extends RepeatMessage {
@@ -161,6 +164,14 @@ export async function apply(ctx: Context, config: Config) {
         startTime: 'unsigned',
         endTime: 'unsigned',
         interrupter: 'string',
+        quote: {
+            type: 'object',
+            inner: {
+                valid: 'boolean',
+                content: 'string',
+                id: 'string'
+            }
+        },
         images: {
             type: 'array',
             inner: {
@@ -460,11 +471,7 @@ export async function apply(ctx: Context, config: Config) {
         const words = rec.words = jieba
             .tag(text)
 
-        if ('id' in rec) await ctx.database.set(
-            'w-repeat-record',
-            { id: rec.id },
-            { words: words.map(word => $.literal(word)) }
-        )
+        if ('id' in rec) await ctx.database.set('w-repeat-record', { id: rec.id }, { words })
 
         return words
     }
@@ -473,6 +480,7 @@ export async function apply(ctx: Context, config: Config) {
         gid,
         content: undefined,
         images: undefined,
+        quote: undefined,
         senders: undefined,
         startTime: undefined,
         endTime: undefined,
@@ -480,6 +488,22 @@ export async function apply(ctx: Context, config: Config) {
         suspensions: [],
         unrelatedCount: 0
     })
+
+    const updateRecQuote = (session: Session, rec: RepeatQueuedRecord) => {
+        if (! session.quote) return
+        if (! rec.quote) {
+            rec.quote = {
+                valid: true,
+                ...pick(session.quote, [ 'id', 'content' ])
+            }
+            return
+        }
+        if (! rec.quote.valid) return
+        if (rec.quote.id === session.quote.id) return
+        rec.quote = {
+            valid: false
+        }
+    }
 
     const unescapeMessage = (
         message: RepeatMessage,
@@ -573,6 +597,8 @@ export async function apply(ctx: Context, config: Config) {
                 if (isSameMessage(thisMessage, rec)) {
                     // 讲当前用户添加到复读发送者（暂不区分挂起状态、未激活状态下的发送者）
                     rec.senders.push(uid)
+                    // 更新回复
+                    updateRecQuote(session, rec)
                     // 重置无关消息计数器
                     rec.unrelatedCount = 0
                     // 调用相同消息处理函数
@@ -612,8 +638,13 @@ export async function apply(ctx: Context, config: Config) {
             }
         })
 
-        // 如果发生复读，将当前用户加入运行时的发送者列表中
-        if (isRepeating) currentRec.senders.push(uid)
+        // 如果发生复读
+        if (isRepeating) {
+            // 将当前用户加入运行时的发送者列表中
+            currentRec.senders.push(uid)
+            // 更新回复
+            updateRecQuote(session, currentRec)
+        }
         // 当前复读的复读条数，大于 1 则为完整复读
         const repeatCount = currentRec?.senders?.length ?? 0
 
@@ -686,16 +717,21 @@ export async function apply(ctx: Context, config: Config) {
                     content,
                     images,
                     startTime: session.timestamp,
-                    senders: [ uid ]
+                    senders: [ uid ],
                 }
+                updateRecQuote(session, currentRec)
                 // 滚动复读队列
                 runtime.queuedRecs.unshift(currentRec)
             }
         }
 
         // 机器人复读
-        if (currentRec.senders.length === config.repeatCount)
-            return botRepeat(h.parse(unescapeMessage(thisMessage)))
+        if (currentRec.senders.length === config.repeatCount) {
+            return h('as-forward', { level: 'never' }, [
+                currentRec.quote?.valid ? h.quote(currentRec.quote.id) : '',
+                ...h.parse(unescapeMessage(currentRec))
+            ])
+        }
 
         // 传向下一个中间件
         return next()
@@ -1181,6 +1217,7 @@ export async function apply(ctx: Context, config: Config) {
                 const dataExists = await ctx.database
                     .select('w-repeat-calendar')
                     .where({
+                        gid,
                         month: 'YYYY-MM',
                         day: { $ne: today },
                         [idKey]: { $ne: null }
@@ -1357,7 +1394,10 @@ export async function apply(ctx: Context, config: Config) {
             } as const)[options.type]
 
             const { output, dataToUpsert } = await getCalendar(topType)
-            await ctx.database.upsert('w-repeat-calendar', dataToUpsert)
+            await ctx.database.upsert('w-repeat-calendar', dataToUpsert.map(day => ({
+                ...day,
+                gid
+            })))
             return output
         })
 
