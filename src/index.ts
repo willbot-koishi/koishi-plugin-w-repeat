@@ -26,38 +26,60 @@ export const inject = {
     optional: [ 'echarts', 'tesseract', 'jieba' ]
 }
 
-export interface Config {
+export interface RepeatSettings {
+    doWrite: boolean
+
     repeatCount: number
     maxUnrelatedCount: number
-    displayLength: number
-    imageTextDisplayLength: number
-    displayPageSize: number
+
     repeatBlacklist: string[]
+
     doProceedImage: boolean
     enableOcr: boolean
-    ocrLangs: string[]
+
     enableSegmentation: boolean
     segmentationWordBlacklist: string[]
     segmentationTagBlacklist: string[]
-    doWrite: boolean
 }
 
-export const Config: z<Config> = z.object({
+export const RepeatSettings: z<RepeatSettings> = z.object({
+    doWrite: z.boolean().default(true).description('是否启用复读写入（包括记录和机器人复读，不包括查询）'),
+
     repeatCount: z.natural().default(0).description('机器人复读需要的次数，0 为不复读'),
     maxUnrelatedCount: z.natural().default(5).description('恢复挂起的复读前允许的最大无关消息条数，0 为禁用挂起'),
-    displayLength: z.natural().default(25).description('复读消息最大长度，超过则显示为省略号'),
-    imageTextDisplayLength: z.natural().default(15).description('图片文字预览最大长度，超过则显示为省略号'),
-    displayPageSize: z.natural().min(5).default(10).description('复读消息分页大小，至少为 5'),
+
     repeatBlacklist: z.array(z.string()).description('复读内容黑名单'),
+
     doProceedImage: z.boolean().default(false).description('是否处理图片（会使用较多数据库空间）'),
     enableOcr: z.boolean().default(true).description('是否自动识别复读消息图片中文字'),
-    ocrLangs: z.array(z.string()).default([ 'chi_sim', 'eng' ]).description('识别图片中文字时尝试的语言，参考 ' +
-        '<https://tesseract-ocr.github.io/tessdoc/Data-Files#data-files-for-version-400-november-29-2016>'
-    ),
+
     enableSegmentation: z.boolean().default(true).description('是否对复读消息分词'),
     segmentationWordBlacklist: z.array(z.string()).description('复读词频统计中不显示的词'),
     segmentationTagBlacklist: z.array(z.string()).description('复读词频统计中不显示的词性'),
-    doWrite: z.boolean().default(true).description('是否向数据库写入复读数据')
+})
+
+export interface Config {
+    displayLength: number
+    imageTextDisplayLength: number
+    displayPageSize: number
+
+    ocrLangs: string[]
+
+    globalSettings: RepeatSettings
+    guildSettings: Record<string, RepeatSettings>
+}
+
+export const Config: z<Config> = z.object({
+    globalSettings: RepeatSettings.description('全局复读设置'),
+    guildSettings: z.dict(RepeatSettings).description('群复读设置'),
+
+    displayLength: z.natural().default(25).description('复读消息最大长度，超过则显示为省略号'),
+    imageTextDisplayLength: z.natural().default(15).description('图片文字预览最大长度，超过则显示为省略号'),
+    displayPageSize: z.natural().min(5).default(10).description('复读消息分页大小，至少为 5'),
+
+    ocrLangs: z.array(z.string()).default([ 'chi_sim', 'eng' ]).description('识别图片中文字时尝试的语言，参考 ' +
+        '<https://tesseract-ocr.github.io/tessdoc/Data-Files#data-files-for-version-400-november-29-2016>'
+    ),
 })
 
 declare module 'koishi' {
@@ -245,7 +267,7 @@ export async function apply(ctx: Context, config: Config) {
     let tesseractWorker: Tesseract.Worker = undefined
     const initTesseract = async () => {
         try {
-            const { ocrLangs } = config 
+            const { ocrLangs } = config
             await ctx.tesseract.installNecessaryLangs(ocrLangs)
             tesseractWorker = await ctx.tesseract.createWorker(ocrLangs)
             ctx.logger.success('Inited Tesseract.')
@@ -276,6 +298,9 @@ export async function apply(ctx: Context, config: Config) {
     ])
 
     // 工具函数
+    // 配置
+    const getGuildSettings = (gid: string) => config.guildSettings[gid] ?? config.globalSettings
+
     // String
     const ellipsis = (s: string, maxLength: number): string => {
         const els = h.parse(s)
@@ -534,15 +559,19 @@ export async function apply(ctx: Context, config: Config) {
     // 复读中间件
     const runtimes: Record<string, RepeatRuntime> = {}
     ctx.middleware(async (session, next) => {
-        // 配置为不写入则跳过
-        if (! config.doWrite) return next()
-
         // 只处理群内消息
         const { content: originalContent, gid, uid } = session
         if (! session.guildId) return next()
 
+        // 依次检查群和全局是否启用复读
+        const settings = getGuildSettings(gid)
+        if (gid in config.guildSettings) {
+            if (! config.guildSettings[gid]) return next()
+        }
+        else if (! settings.doWrite) return next()
+
         // 过滤内容黑名单
-        if (config.repeatBlacklist.some(re => new RegExp(re).test(originalContent)))
+        if (settings.repeatBlacklist.some(re => new RegExp(re).test(originalContent)))
             return next()
 
         // 解析消息，处理图片
@@ -550,7 +579,7 @@ export async function apply(ctx: Context, config: Config) {
         const content = h
             .parse(originalContent)
             .map(el => {
-                if (config.doProceedImage && el.type === 'img') {
+                if (settings.doProceedImage && el.type === 'img') {
                     const src = el.attrs.src as string
                     imageSrcs.push(src)
                     return '@__KOISHI_IMG__@'
@@ -608,7 +637,7 @@ export async function apply(ctx: Context, config: Config) {
                     // 增加无关消息计数器
                     const count = ++ rec.unrelatedCount
                     // 如果无关消息多于阈值，将该复读标记为删除
-                    if (count > config.maxUnrelatedCount) rec.deleted = true
+                    if (count > settings.maxUnrelatedCount) rec.deleted = true
                 }
             }))
             // 清理标记删除的复读
@@ -693,13 +722,13 @@ export async function apply(ctx: Context, config: Config) {
                         interruptTime: $inc(row.interruptTime)
                     }]),
                     // 识别图片中文字
-                    (config.enableOcr && tesseractWorker) ? updateImageText(currentRec) : undefined,
+                    (settings.enableOcr && tesseractWorker) ? updateImageText(currentRec) : undefined,
                     // 分词
-                    (config.enableSegmentation && jieba) ? updateWords(currentRec) : undefined
+                    (settings.enableSegmentation && jieba) ? updateWords(currentRec) : undefined
                 ])
 
                 // 如果允许挂起，挂起被打断的复读
-                if (config.maxUnrelatedCount && old.senders.length > 1) {
+                if (settings.maxUnrelatedCount && old.senders.length > 1) {
                     runtime.suspendedRecs.unshift({
                         ...old,
                         unrelatedCount: 1,
@@ -726,7 +755,7 @@ export async function apply(ctx: Context, config: Config) {
         }
 
         // 机器人复读
-        if (currentRec.senders.length === config.repeatCount) {
+        if (currentRec.senders.length === settings.repeatCount) {
             return h('as-forward', { level: 'never' }, [
                 currentRec.quote?.valid ? h.quote(currentRec.quote.id) : '',
                 ...h.parse(unescapeMessage(currentRec))
@@ -934,6 +963,7 @@ export async function apply(ctx: Context, config: Config) {
         }) => {
             if (! guildId && ! assignedGid && ! isGlobal) return '请在群内调用'
             if (assignedGid) gid = assignedGid
+            const settings = getGuildSettings(gid)
 
             const tags = tagStr ? tagStr.split(',') : null
 
@@ -941,10 +971,10 @@ export async function apply(ctx: Context, config: Config) {
                 .select('w-repeat-word')
                 .where({
                     gid: isGlobal ? {} : gid,
-                    word: all ? {} : { $not: { $in: config.segmentationWordBlacklist } },
+                    word: all ? {} : { $not: { $in: settings.segmentationWordBlacklist } },
                     tag: {
                         $and: [
-                            all ? {} : { $not: { $in: config.segmentationWordBlacklist } },
+                            all ? {} : { $not: { $in: settings.segmentationWordBlacklist } },
                             tags ? { $in: tags } : {}
                         ]
                     }
@@ -1500,25 +1530,53 @@ export async function apply(ctx: Context, config: Config) {
     ctx.command('repeat.debug.runtime.list', '获取复读运行时列表', { authority: 2 })
         .action(() => '运行时列表：' + Object.keys(runtimes).join(', '))
 
-    ctx.command('repeat.admin', '复读管理', { hidden: true })
+    ctx.command('repeat.admin', '复读管理')
         .alias('repeat.a')
 
-    ctx.command('repeat.admin.conf', '查看复读配置')
-        .option('switch', '-S 开关复读写入', { authority: 4 })
-        .action(({ options }) => {
-            if (options.switch) {
-                config.doWrite = ! config.doWrite
-                ctx.scope.update(config)
+    ctx.command('repeat.admin.settings [key:string] [value:string]', '管理群复读设置')
+        .action(async ({ session, options }, key, value) => {
+            const [ member, user ] = await Promise.all([
+                session.bot.getGuildMember(session.guildId, session.userId),
+                session.observeUser([ 'authority' ]),
+            ])
+            if (user.authority < 3 && ! member.roles.some(role => [ 'admin', 'owner' ].includes(role))) {
+                return '只有群主、管理员或 Koishi 管理员（权限等级 ≥ 3）可以管理群复读设置。'
             }
-            return dedent`
-                复读配置
-                ====================
-                复读写入：${config.doWrite}
-                处理图片：${config.doProceedImage}
-                自动识别图片：${config.enableOcr}
-                自动分词：${config.enableSegmentation}
-                复读内容黑名单：${config.repeatBlacklist.map(re => `/${re}/`).join(', ')}
-            `
+
+            const settings = config.guildSettings[session.gid] ??= config.globalSettings
+
+            const displaySettingItem = (symbol: string, desc) => (key: string) => (
+                `${key}${desc ? ` /* ${RepeatSettings.dict[key].meta.description} */` : ''}${symbol}${JSON.stringify(settings[key])}`
+            )
+
+            if (! key && ! value) {
+                return (
+                    '群复读设置：{\n' +
+                    Object
+                        .keys(RepeatSettings.dict)
+                        .map(key => '  ' + displaySettingItem(': ', true)(key))
+                        .join('\n') +
+                    '\n}'
+                )
+            }
+
+            if (! (key in RepeatSettings.dict)) {
+                return `未知设置项 '${key}'`
+            }
+
+            if (! value) {
+                return `群复读设置：${displaySettingItem(' == ', false)(key)}`
+            }
+           
+            try {
+                const validated = RepeatSettings.dict[key](JSON.parse(value))
+                settings[key] = validated
+                ctx.scope.update(config)
+                return `已修改群复读设置：${displaySettingItem(' = ', false)(key)}`
+            }
+            catch {
+                return `无法解析设置值 '${value}'`
+            }
         })
         
     ctx.command('repeat.admin.regen-user-table', '重建复读用户表', { authority: 4 })
