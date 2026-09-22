@@ -44,7 +44,8 @@
   "koishi": {
     "service": {
       "required": [
-        "database"
+        "database",
+        "messageDb"
       ],
       "optional": [
         "echarts",
