@@ -55,32 +55,41 @@ const normalizeContent = (content = '') => h.transform(
 
 const getUid = (message: SavedMessage) => `${message.platform}:${message.userId}`
 
-function findRepeatSequences(record: LegacyRepeatRecord, candidates: SavedMessage[]) {
-  const normalized = normalizeContent(record.content)
-  const matches = record.senders.map((uid, position) => candidates
-    .map((message, index) => ({ message, index }))
-    .filter(({ message }) =>
-      getUid(message) === uid &&
-      normalizeContent(message.content) === normalized &&
-      (position > 0 || Math.abs(message.timestamp - record.startTime) <= MATCH_TOLERANCE)
-    ))
-  if (matches.some(items => ! items.length)) return []
+interface SequenceMatch {
+  count: 0 | 1 | 2
+  messages?: SavedMessage[]
+}
 
-  const sequences: SavedMessage[][] = []
-  const visit = (position: number, previousIndex: number, sequence: SavedMessage[]) => {
-    if (sequences.length > 1) return
-    if (position === matches.length) {
-      sequences.push(sequence)
-      return
-    }
-    for (const item of matches[position]) {
-      if (item.index <= previousIndex) continue
-      visit(position + 1, item.index, [...sequence, item.message])
-      if (sequences.length > 1) return
+function findRepeatSequence(record: LegacyRepeatRecord, candidates: SavedMessage[]): SequenceMatch {
+  const normalized = normalizeContent(record.content)
+  // states[position] describes the ways to match the first `position` senders.
+  // Counts are capped at two because callers only distinguish none, unique, and ambiguous.
+  const states: SequenceMatch[] = Array.from(
+    { length: record.senders.length + 1 },
+    () => ({ count: 0 }),
+  )
+  states[0] = { count: 1, messages: [] }
+
+  for (const message of candidates) {
+    if (normalizeContent(message.content) !== normalized) continue
+    const uid = getUid(message)
+
+    // Walk backwards so one candidate cannot fill multiple sender positions.
+    for (let position = record.senders.length - 1; position >= 0; position --) {
+      if (record.senders[position] !== uid) continue
+      if (position === 0 && Math.abs(message.timestamp - record.startTime) > MATCH_TOLERANCE) continue
+
+      const source = states[position]
+      if (! source.count) continue
+      const target = states[position + 1]
+      const count = Math.min(target.count + source.count, 2) as SequenceMatch['count']
+      states[position + 1] = count === 1
+        ? { count, messages: [...source.messages!, message] }
+        : { count }
     }
   }
-  visit(0, -1, [])
-  return sequences
+
+  return states.at(-1)!
 }
 
 function findNearest(
@@ -103,10 +112,10 @@ export function matchLegacyRepeat(
   record: LegacyRepeatRecord,
   candidates: SavedMessage[],
 ): RepeatMatchResult {
-  const sequences = findRepeatSequences(record, candidates)
-  if (! sequences.length) return { status: 'unmatched', reason: 'repeat message sequence not found' }
-  if (sequences.length > 1) return { status: 'ambiguous', reason: 'multiple repeat message sequences' }
-  const messages = sequences[0]
+  const sequence = findRepeatSequence(record, candidates)
+  if (! sequence.count) return { status: 'unmatched', reason: 'repeat message sequence not found' }
+  if (sequence.count > 1) return { status: 'ambiguous', reason: 'multiple repeat message sequences' }
+  const messages = sequence.messages!
   const lastTimestamp = messages.at(-1).timestamp
 
   let interrupter: SavedMessage | undefined

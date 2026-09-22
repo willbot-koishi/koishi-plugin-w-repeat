@@ -145,6 +145,25 @@ describe('repeat migration matching', () => {
       reason: 'multiple repeat message sequences',
     })
   })
+
+  it('rejects an impossible long sequence without exponential backtracking', () => {
+    const candidates = Array.from({ length: 48 }, (_, index) =>
+      message(String(index), 'u1', 'same', 1000 + index))
+    const result = matchLegacyRepeat({
+      id: 1,
+      gid: 'test:100',
+      content: 'same',
+      senders: Array.from({ length: 52 }, () => 'test:u1'),
+      startTime: 1000,
+      endTime: 2000,
+      suspensions: [],
+    }, candidates)
+
+    assert.deepEqual(result, {
+      status: 'unmatched',
+      reason: 'repeat message sequence not found',
+    })
+  })
 })
 
 it('migrates resumably and records unresolved rows', async () => {
