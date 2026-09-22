@@ -19,6 +19,8 @@ import { type Jieba, type Tag } from 'koishi-plugin-w-jieba'
 import dedent from 'dedent'
 import dayjs, { type Dayjs } from 'dayjs'
 
+import { extendRepeatV2Models } from './model-v2'
+
 export const name = 'w-repeat'
 
 export const inject = {
@@ -179,6 +181,7 @@ export interface RepeatWord {
 
 export async function apply(ctx: Context, config: Config) {
   // 扩展数据库模型
+  extendRepeatV2Models(ctx)
   ctx.model.extend('w-repeat-record', {
     id: 'unsigned',
     gid: 'string',
