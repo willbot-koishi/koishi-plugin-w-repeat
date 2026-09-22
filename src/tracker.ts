@@ -111,7 +111,6 @@ export function transitionRepeat(
           })
         }
         resumedRecordId = candidate.persistedId
-        delete candidate.persistedId
         delete candidate.pendingSuspension
         state.queued = state.queued.filter(item => item !== resumeCandidate)
         current = state.current = candidate

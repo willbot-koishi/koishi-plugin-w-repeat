@@ -672,6 +672,32 @@ export async function apply(ctx: Context, config: Config) {
   ].filter((key): key is string => !! key))]
 
   const persistCandidate = async (candidate: RepeatCandidate): Promise<number> => {
+    if (candidate.persistedId !== undefined) {
+      const id = candidate.persistedId
+      // A resumed candidate only grows: retain the superset first, then extend
+      // its ordered rows, and publish the updated metadata last. This keeps the
+      // previous valid record readable if the process exits between writes.
+      await ctx.messageDb.retainMessages(`w-repeat:${id}`, getReferencedKeys(candidate))
+      await ctx.database.upsert('w-repeat-message-v2', candidate.messages.map((message, index) => ({
+        recordId: id,
+        index,
+        messageKey: message.key,
+        platform: message.platform,
+        userId: message.userId,
+      })))
+      await ctx.database.upsert('w-repeat-record-v2', [{
+        id,
+        platform: candidate.messages[0].platform,
+        guildId: candidate.messages[0].guildId,
+        starterMessageKey: candidate.messages[0].key,
+        interrupterMessageKey: candidate.interrupter?.key,
+        startTime: candidate.startTime,
+        endTime: candidate.endTime,
+        suspensions: candidate.suspensions,
+      }])
+      return id
+    }
+
     while (true) {
       const id = await allocateRecordId()
       const owner = `w-repeat:${id}`
@@ -793,7 +819,7 @@ export async function apply(ctx: Context, config: Config) {
       })
 
       if (transition.resumedRecordId !== undefined) {
-        await removePersistedCandidate(transition.resumedRecordId)
+        ctx.logger.debug('resumed repeat record %d in %s', transition.resumedRecordId, gid)
       }
       if (transition.stats) await updateV2RepeatStats(transition.stats, uid)
       if (transition.completed) {

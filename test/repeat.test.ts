@@ -151,6 +151,12 @@ describe('repeat tracking', () => {
       [ 'u1', 'A' ],
       [ 'u2', 'A' ],
       [ 'u3', 'B' ],
+    ] as const) {
+      await ctx.mock.client(uid, 'group').receive(content, 0)
+    }
+    const [suspended] = await getRecords(ctx, 'A')
+
+    for (const [ uid, content ] of [
       [ 'u4', 'A' ],
       [ 'u5', 'A' ],
       [ 'u6', 'C' ],
@@ -160,6 +166,7 @@ describe('repeat tracking', () => {
 
     const records = await getRecords(ctx, 'A')
     assert.equal(records.length, 1)
+    assert.equal(records[0].id, suspended.id)
     assert.deepEqual(await getRecordSenders(ctx, records[0].id), [
       'mock:u1', 'mock:u2', 'mock:u4', 'mock:u5'
     ])

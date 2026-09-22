@@ -48,6 +48,7 @@ describe('repeat tracker', () => {
     const result = transitionRepeat(state, message(5, 'A'), options)
 
     assert.equal(result.resumedRecordId, 10)
+    assert.equal(result.current.persistedId, 10)
     assert.deepEqual(result.current.messages.map(item => item.key), [
       'message-1', 'message-2', 'message-4', 'message-5',
     ])
