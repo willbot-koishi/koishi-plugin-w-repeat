@@ -13,6 +13,7 @@
     "moduleResolution": "bundler",
     "jsx": "react-jsx",
     "jsxImportSource": "@satorijs/element",
+    "strictNullChecks": false,
     "types": [
       "node",
       "yml-register/types"

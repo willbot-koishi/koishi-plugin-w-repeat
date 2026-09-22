@@ -15,20 +15,20 @@
     "plugin"
   ],
   "peerDependencies": {
-    "koishi": "^4.18.7",
+    "koishi": "^4.18.10",
     "koishi-plugin-w-as-forward": "workspace:^",
     "koishi-plugin-w-option-conflict": "^0.1.1"
   },
   "dependencies": {
-    "@satorijs/element": "^3.1.7",
-    "dayjs": "^1.11.13",
-    "dedent": "^1.6.0",
+    "@satorijs/element": "^3.1.8",
+    "dayjs": "^1.11.19",
+    "dedent": "^1.7.1",
     "pretty-format": "^29.7.0"
   },
   "devDependencies": {
-    "@koishijs/plugin-database-memory": "^3.6.0",
+    "@koishijs/plugin-database-memory": "^3.7.0",
     "@koishijs/plugin-mock": "^2.6.6",
-    "@satorijs/protocol": "^1.6.0",
+    "@satorijs/protocol": "^1.6.1",
     "@willbot-koishi/jieba": "^0.5.0",
     "koishi-plugin-puppeteer": "^3.9.0",
     "koishi-plugin-w-as-forward": "workspace:^",
@@ -36,22 +36,25 @@
     "koishi-plugin-w-jieba": "workspace:^",
     "koishi-plugin-w-node": "workspace:^",
     "koishi-plugin-w-option-conflict": "^0.1.1",
-    "koishi-plugin-w-tesseract": "workspace:^"
+    "koishi-plugin-w-tesseract": "workspace:^",
+    "mongodb": "^6.21.0"
   },
   "koishi": {
     "service": {
       "required": [
-        "database",
-        "reactive"
+        "database"
       ],
       "optional": [
-        "echarts"
+        "echarts",
+        "tesseract",
+        "jieba"
       ]
     }
   },
   "scripts": {
-    "build": "yarn workspace willbot build w-repeat",
-    "bump": "yarn workspace willbot bump w-repeat",
-    "pub": "yarn workspace willbot pub w-repeat"
+    "build": "yarn run -T build w-repeat",
+    "bump": "yarn run -T bump w-repeat",
+    "pub": "yarn run -T pub w-repeat",
+    "test": "yarn run -T tsx --test test/*.test.ts"
   }
 }
