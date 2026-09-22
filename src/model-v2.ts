@@ -26,10 +26,32 @@ export interface RepeatMessageV2 {
   userId: string
 }
 
+export type RepeatMigrationStatus = 'migrated' | 'unmatched' | 'ambiguous'
+
+export interface RepeatRecordMigration {
+  legacyId: number
+  status: RepeatMigrationStatus
+  reason: string
+  updatedAt: Date
+}
+
+export interface RepeatMigration {
+  id: string
+  cursor?: number
+  processed: number
+  migrated: number
+  unmatched: number
+  ambiguous: number
+  total: number
+  completedAt?: Date
+}
+
 declare module 'koishi' {
   interface Tables {
     'w-repeat-record-v2': RepeatRecordV2
     'w-repeat-message-v2': RepeatMessageV2
+    'w-repeat-record-migration': RepeatRecordMigration
+    'w-repeat-migration': RepeatMigration
   }
 }
 
@@ -73,5 +95,30 @@ export function extendRepeatV2Models(ctx: Context) {
       ['messageKey'],
       ['platform', 'userId', 'recordId'],
     ],
+  })
+
+  ctx.model.extend('w-repeat-record-migration', {
+    legacyId: 'unsigned',
+    status: 'string',
+    reason: 'text',
+    updatedAt: 'timestamp',
+  }, {
+    primary: 'legacyId',
+    indexes: [
+      ['status'],
+    ],
+  })
+
+  ctx.model.extend('w-repeat-migration', {
+    id: 'string',
+    cursor: { type: 'unsigned', nullable: true, initial: null },
+    processed: { type: 'unsigned', length: 8, initial: 0 },
+    migrated: { type: 'unsigned', length: 8, initial: 0 },
+    unmatched: { type: 'unsigned', length: 8, initial: 0 },
+    ambiguous: { type: 'unsigned', length: 8, initial: 0 },
+    total: { type: 'unsigned', length: 8, initial: 0 },
+    completedAt: { type: 'timestamp', nullable: true, initial: null },
+  }, {
+    primary: 'id',
   })
 }

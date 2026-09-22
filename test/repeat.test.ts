@@ -213,8 +213,29 @@ describe('repeat tracking', () => {
     const service = ctx.messageDb as unknown as MessageDbMock
     assert.equal(service.references.has(`w-repeat:${record.id}`), true)
 
+    await ctx.database.upsert('w-repeat-record', [{
+      id: record.id,
+      gid: 'mock:group',
+      content: 'saved in message-db',
+      senders: ['mock:starter', 'mock:repeater'],
+      startTime: record.startTime,
+      endTime: record.endTime,
+      interrupter: 'mock:interrupter',
+      quote: null,
+      images: [],
+      words: [],
+      suspensions: [],
+    }])
+    await ctx.database.upsert('w-repeat-record-migration', [{
+      legacyId: record.id,
+      status: 'migrated',
+      reason: '',
+      updatedAt: new Date(),
+    }])
+
     const [stats] = await starter.receive('repeat.stat -d all', 1)
     assert.match(stats, /saved in message-db/)
+    assert.match(stats, /共有 1 次/)
 
     const [detail] = await starter.receive(`repeat.record ${record.id}`, 1)
     assert.match(detail, /saved in message-db/)
@@ -224,6 +245,7 @@ describe('repeat tracking', () => {
     assert.match(deleted, /\[已删除\]/)
     assert.deepEqual(await ctx.database.get('w-repeat-record-v2', { id: record.id }), [])
     assert.deepEqual(await ctx.database.get('w-repeat-message-v2', { recordId: record.id }), [])
+    assert.deepEqual(await ctx.database.get('w-repeat-record', { id: record.id }), [])
     assert.equal(service.references.has(`w-repeat:${record.id}`), false)
   })
 })

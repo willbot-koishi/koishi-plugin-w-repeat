@@ -22,6 +22,7 @@ import dedent from 'dedent'
 import dayjs, { type Dayjs } from 'dayjs'
 
 import { extendRepeatV2Models, type RepeatRecordV2 } from './model-v2'
+import { migrateRepeatRecords, REPEAT_MESSAGE_MIGRATION_ID } from './migration'
 import {
   createRepeatTrackerState,
   suspendPersistedCandidate,
@@ -609,6 +610,19 @@ export async function apply(ctx: Context, config: Config) {
     hasImage: !! record.images?.length,
   })
 
+  const filterUnmigratedLegacy = async <T extends { id: number }>(records: T[]): Promise<T[]> => {
+    if (! records.length) return records
+    const migratedIds = new Set<number>()
+    for (let index = 0; index < records.length; index += 500) {
+      const outcomes = await ctx.database.get('w-repeat-record-migration', {
+        legacyId: { $in: records.slice(index, index + 500).map(record => record.id) },
+        status: 'migrated',
+      })
+      outcomes.forEach(outcome => migratedIds.add(outcome.legacyId))
+    }
+    return records.filter(record => ! migratedIds.has(record.id))
+  }
+
   // New records use message-db as their only content and asset source.
   const trackerStates = new Map<string, RepeatTrackerState>()
   const guildTasks = new Map<string, Promise<void>>()
@@ -862,7 +876,7 @@ export async function apply(ctx: Context, config: Config) {
         'id', 'gid', 'content', 'senders', 'startTime', 'endTime', 'interrupter', 'images'
       ])
 
-      const legacyRecs = await ctx.database
+      const legacyRecs = await filterUnmigratedLegacy(await ctx.database
         .select('w-repeat-record')
         .where(row => $.query(row, {
           gid: isGlobal ? {} : gid,
@@ -896,7 +910,7 @@ export async function apply(ctx: Context, config: Config) {
             : undefined
         } satisfies Dict<Selection.Callback<RepeatRecord & { count: number }>>))
         .orderBy(sortMethod as any, sortDirection)
-        .execute()
+        .execute())
 
       const v2Records = (await getV2Records(
         isGlobal ? undefined : gid,
@@ -1113,13 +1127,13 @@ export async function apply(ctx: Context, config: Config) {
 
       const starterDict: Record<string, { name: string, count: number }> = {}
       const sendMat: Record<string, Record<string, { count: number }>> = {}
-      const legacyRecs = await ctx.database
+      const legacyRecs = await filterUnmigratedLegacy(await ctx.database
         .select('w-repeat-record')
         .where({
           gid,
           ...parseDuration(options.duration)
         })
-        .execute()
+        .execute())
       const recs = [
         ...legacyRecs.map(asUnifiedV1),
         ...await getV2Records(gid, parseDuration(options.duration)),
@@ -1231,11 +1245,11 @@ export async function apply(ctx: Context, config: Config) {
       const gid = options.guild ?? session.gid
 
       // TODO: optimize
-      const legacyRecs = await ctx.database
+      const legacyRecs = await filterUnmigratedLegacy(await ctx.database
         .select('w-repeat-record')
         .where({ gid })
-        .project([ 'startTime' ])
-        .execute()
+        .project([ 'id', 'startTime' ])
+        .execute())
       const recs = [
         ...legacyRecs,
         ...await ctx.database.get('w-repeat-record-v2', {
@@ -1355,10 +1369,10 @@ export async function apply(ctx: Context, config: Config) {
             const date = dayjs(`${month}-${day}`)
             const start = + date.startOf('day')
             const end = + date.endOf('day')
-            const legacyRecs = await ctx.database.get('w-repeat-record', {
+            const legacyRecs = await filterUnmigratedLegacy(await ctx.database.get('w-repeat-record', {
               gid,
               startTime: { $gte: start, $lte: end }
-            })
+            }))
             const recs = [
               ...legacyRecs.map(asUnifiedV1),
               ...await getV2Records(gid, {
@@ -1531,7 +1545,7 @@ export async function apply(ctx: Context, config: Config) {
       const [v2Record] = await ctx.database.get('w-repeat-record-v2', { id })
       const [legacyRecord] = v2Record
         ? []
-        : await ctx.database.get('w-repeat-record', { id })
+        : await filterUnmigratedLegacy(await ctx.database.get('w-repeat-record', { id }))
       const rec = v2Record
         ? (await hydrateV2Records([v2Record]))[0]
         : legacyRecord && asUnifiedV1(legacyRecord)
@@ -1544,7 +1558,12 @@ export async function apply(ctx: Context, config: Config) {
       let content: string
 
       if (options.delete) {
-        if (rec.storageVersion === 2) await removePersistedCandidate(id)
+        if (rec.storageVersion === 2) {
+          await removePersistedCandidate(id)
+          // A migrated v2 row may still have its read-only v1 source. Deleting a
+          // visible record must not allow that source to reappear on direct lookup.
+          await ctx.database.remove('w-repeat-record', { id })
+        }
         else await ctx.database.remove('w-repeat-record', { id })
         content = '[已删除]'
       }
@@ -1635,6 +1654,79 @@ export async function apply(ctx: Context, config: Config) {
   ctx.command('repeat.admin', '复读管理')
     .alias('repeat.a')
 
+  let migrationTask: {
+    controller: AbortController
+    promise: Promise<void>
+  } | undefined
+  let migrationError: string | undefined
+
+  const describeMigration = async () => {
+    const [state] = await ctx.database.get('w-repeat-migration', REPEAT_MESSAGE_MIGRATION_ID)
+    if (! state) return '复读记录迁移尚未开始。'
+    const status = migrationTask
+      ? '运行中'
+      : migrationError
+        ? `失败（${migrationError}）`
+        : state.completedAt
+          ? `已完成（${dayjs(state.completedAt).format('YYYY-MM-DD HH:mm:ss')}）`
+          : '已暂停'
+    return dedent`
+      复读记录迁移：${status}
+      进度：${state.processed}/${state.total}
+      成功：${state.migrated}
+      未匹配：${state.unmatched}
+      有歧义：${state.ambiguous}
+      游标：${state.cursor ?? '无'}
+    `
+  }
+
+  ctx.command('repeat.admin.migrate-message-db [action:string]', '管理 message-db 复读记录迁移', { authority: 4 })
+    .option('batch', '-b <batch:posint> 每批处理的记录数', { fallback: 100 })
+    .action(async ({ options }, action = 'status') => {
+      if (action === 'status') return describeMigration()
+      if (action === 'stop') {
+        if (! migrationTask) return '当前没有正在运行的复读记录迁移。'
+        const task = migrationTask
+        task.controller.abort()
+        await task.promise
+        return describeMigration()
+      }
+      if (action !== 'start') return '可用操作：start、stop、status。'
+      if (migrationTask) return '复读记录迁移已经在运行。'
+
+      const controller = new AbortController()
+      migrationError = undefined
+      let lastLogged = 0
+      const promise = migrateRepeatRecords(ctx, {
+        batchSize: options.batch,
+        signal: controller.signal,
+        onProgress: ({ state }) => {
+          if (state.processed - lastLogged < options.batch && ! state.completedAt) return
+          lastLogged = state.processed
+          ctx.logger.info(
+            'repeat migration: %d/%d processed, %d migrated, %d unmatched, %d ambiguous',
+            state.processed, state.total, state.migrated, state.unmatched, state.ambiguous,
+          )
+        },
+      }).then((state) => {
+        ctx.logger.info(
+          'repeat migration completed: %d migrated, %d unmatched, %d ambiguous',
+          state.migrated, state.unmatched, state.ambiguous,
+        )
+      }).catch((error) => {
+        if (error?.name === 'AbortError') {
+          ctx.logger.info('repeat migration stopped')
+          return
+        }
+        migrationError = error instanceof Error ? error.message : String(error)
+        ctx.logger.error('repeat migration failed: %o', error)
+      }).finally(() => {
+        if (migrationTask?.controller === controller) migrationTask = undefined
+      })
+      migrationTask = { controller, promise }
+      return '复读记录迁移已在后台启动；使用 repeat.admin.migrate-message-db status 查看进度。'
+    })
+
   ctx.command('repeat.admin.settings [key:string] [value:string]', '管理群复读设置')
     .action(async ({ session, options }, key, value) => {
       const [ member, user ] = await Promise.all([
@@ -1695,7 +1787,7 @@ export async function apply(ctx: Context, config: Config) {
       await session.send('正在根据复读记录重建用户数据表……')
       await ctx.database.remove('w-repeat-user', {})
       const recs = [
-        ...(await ctx.database.get('w-repeat-record', {})).map(asUnifiedV1),
+        ...(await filterUnmigratedLegacy(await ctx.database.get('w-repeat-record', {}))).map(asUnifiedV1),
         ...await getV2Records(),
       ]
       const users: Record<string, RepeatUser> = {}
@@ -1732,7 +1824,9 @@ export async function apply(ctx: Context, config: Config) {
     .action(({ session }) => profile(async () => {
       if (! tesseractWorker) return 'Tesseract 未加载，无法识别图片中文字'
       await session.send('开始查询数据库……')
-      const recs = await ctx.database.get('w-repeat-record', row => $.gt($.length(row.images), 0))
+      const recs = await filterUnmigratedLegacy(
+        await ctx.database.get('w-repeat-record', row => $.gt($.length(row.images), 0)),
+      )
       const imageCount = recs.reduce(
         (count, rec) => count + (rec.images ?? []).filter(x => x !== null).length,
         0
@@ -1747,7 +1841,7 @@ export async function apply(ctx: Context, config: Config) {
       await session.send('正在清空分词表……')
       await ctx.database.remove('w-repeat-word', {})
       await session.send('开始查询数据库…… ')
-      const legacyRecs = await ctx.database.get('w-repeat-record', {})
+      const legacyRecs = await filterUnmigratedLegacy(await ctx.database.get('w-repeat-record', {}))
       const v2Recs = await getV2Records()
       await session.send(`正在对 ${legacyRecs.length + v2Recs.length} 条复读记录分词……`)
       const wordDict: Record<string, number> = {}
@@ -1785,6 +1879,7 @@ export async function apply(ctx: Context, config: Config) {
 
   // 回收副作用
   ctx.on('dispose', () => {
+    migrationTask?.controller.abort()
     // 终止 tesseract Worker
     tesseractWorker?.terminate()
   })
