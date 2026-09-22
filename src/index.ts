@@ -12,7 +12,7 @@ import { type GuildMember } from '@satorijs/protocol'
 
 import {} from '@koishijs/plugin-help'
 import {} from 'koishi-plugin-w-option-conflict'
-import {} from 'koishi-plugin-w-echarts'
+import { type echarts } from 'koishi-plugin-w-echarts'
 import {} from 'koishi-plugin-w-tesseract'
 import { type Jieba, type Tag } from 'koishi-plugin-w-jieba'
 
@@ -22,8 +22,8 @@ import dayjs, { type Dayjs } from 'dayjs'
 export const name = 'w-repeat'
 
 export const inject = {
-  required: [ 'database' ],
-  optional: [ 'echarts', 'tesseract', 'jieba' ]
+  required: ['database'],
+  optional: ['echarts', 'tesseract', 'jieba']
 }
 
 export interface RepeatSettings {
@@ -228,7 +228,10 @@ export async function apply(ctx: Context, config: Config) {
         }
       }
     }
-  }, { autoInc: true })
+  }, {
+    autoInc: true,
+    indexes: [[ 'gid', 'startTime' ]]
+  })
 
   const counterField = () => ({
     type: 'unsigned',
@@ -274,13 +277,11 @@ export async function apply(ctx: Context, config: Config) {
     try {
       const { ocrLangs } = config
       await ctx.tesseract.installNecessaryLangs(ocrLangs)
-      tesseractWorker = await new Promise(async (res, rej) => res(ctx.tesseract.createWorker(ocrLangs, {
-        errorHandler: (err) => rej(err)
-      })))
-      ctx.logger.success('Inited Tesseract.')
+      tesseractWorker = await ctx.tesseract.createWorker(ocrLangs)
+      ctx.logger.debug('inited Tesseract.')
     }
     catch (error) {
-      ctx.logger.info('Failed to init Tesseract: %o', error)
+      ctx.logger.error('failed to init Tesseract: %o', error)
     }
   }
 
@@ -291,10 +292,10 @@ export async function apply(ctx: Context, config: Config) {
     if (! ctx.jieba) return
     try {
       jieba = new ctx.jieba.Jieba
-      ctx.logger.success('Inited Jieba.')
+      ctx.logger.debug('inited Jieba.')
     }
     catch (error) {
-      ctx.logger.info('Failed to init Jieba: %o', error)
+      ctx.logger.error('failed to init Jieba: %o', error)
     }
   }
 
@@ -485,7 +486,7 @@ export async function apply(ctx: Context, config: Config) {
     &&  isSameImages(message1.images ?? [], message2.images ?? [])
 
   const updateImageText = async (rec: RepeatRecord | RepeatQueuedRecord) => {
-    const { images } = rec
+    const images = rec.images ??= []
 
     await Promise.all(images.filter(x => x !== null).map(async ({ b64 }, i) => {
       const res = await tesseractWorker.recognize(Buffer.from(b64, 'base64'))
@@ -498,7 +499,7 @@ export async function apply(ctx: Context, config: Config) {
 
   const updateWords = async (rec: RepeatRecord | RepeatQueuedRecord) => {
     const text = h.transform(
-      rec.content.replace(/@__KOISHI_IMG__@/g, ''),
+      (rec.content ?? '').replace(/@__KOISHI_IMG__@/g, ''),
       el => el.type === 'text' ? el.toString() : ''
     )
     const words = rec.words = jieba
@@ -549,10 +550,12 @@ export async function apply(ctx: Context, config: Config) {
     } = {}
   ): string => {
     let imageIdx = 0
-    let content = message.content.replace(
+    const images = message.images ?? []
+    let content = (message.content ?? '').replace(
       /@__KOISHI_IMG__@/g,
       () => {
-        const image = message.images[imageIdx ++]
+        const image = images[imageIdx ++]
+        if (! image) return '[图片加载失败]'
         return allowImage
           ? h.img('data:image/png;base64,' + image.b64).toString()
           : `[图片${ image.text ? ': ' + image.text.replace(/\s+/g, ' ') : '' }]`
@@ -579,7 +582,15 @@ export async function apply(ctx: Context, config: Config) {
     else if (! settings.doWrite) return next()
 
     // 过滤内容黑名单
-    if (settings.repeatBlacklist.some(re => new RegExp(re).test(originalContent)))
+    if (settings.repeatBlacklist.some(re => {
+      try {
+        return new RegExp(re).test(originalContent)
+      }
+      catch (error) {
+        ctx.logger.warn('invalid repeat blacklist pattern %o: %s', re, error)
+        return false
+      }
+    }))
       return next()
 
     // 解析消息，处理图片
@@ -598,6 +609,8 @@ export async function apply(ctx: Context, config: Config) {
     const images: RepeatImage[] = await Promise.all(imageSrcs.map(async src => {
       try {
         const res = await fetch(src)
+        if (! res.ok) throw new Error(`HTTP ${res.status} ${res.statusText}`)
+        if (! res.body) throw new Error('response has no body')
         const buffer = await streamToBuffer(res.body)
         return {
           b64: buffer.toString('base64'),
@@ -605,7 +618,7 @@ export async function apply(ctx: Context, config: Config) {
         }
       }
       catch (err) {
-        ctx.logger.error('Failed to download image <%s>, %s', src, err instanceof Error ? err.stack : err)
+        ctx.logger.error('failed to download image <%s>, %s', src, err instanceof Error ? err.stack : err)
         return null
       }
     }))
@@ -629,10 +642,12 @@ export async function apply(ctx: Context, config: Config) {
       recsName: K,
       onSame: (rec: RepeatRuntime[K][number]) => Promise<void>
     ) => {
-      await Promise.all(runtime[recsName].map(async (rec: RepeatRuntime[K][number]) => {
+      // 同一条消息可能命中多个旧候选。串行处理可确保只激活最新的候选，
+      // 避免多个回调并发覆盖 currentRec。
+      for (const rec of runtime[recsName]) {
         // 当前消息与挂起复读内容相同
         if (isSameMessage(thisMessage, rec)) {
-          // 讲当前用户添加到复读发送者（暂不区分挂起状态、未激活状态下的发送者）
+          // 将当前用户添加到复读发送者（暂不区分挂起状态、未激活状态下的发送者）
           rec.senders.push(uid)
           // 更新回复
           updateRecQuote(session, rec)
@@ -647,17 +662,36 @@ export async function apply(ctx: Context, config: Config) {
           // 如果无关消息多于阈值，将该复读标记为删除
           if (count > settings.maxUnrelatedCount) rec.deleted = true
         }
-      }))
+      }
       // 清理标记删除的复读
       runtime[recsName] = runtime[recsName].filter(rec => ! rec.deleted) as RepeatRuntime[K]
     }
 
-    let isNewRec = true 
+    const updateRepeatStats = async (rec: RepeatRecordBase) => Promise.all([
+      // 更新当前用户的复读数据
+      ctx.database.upsert('w-repeat-user', row => [{
+        uid,
+        repeatCount: $inc(row.repeatCount),
+        repeatTime: rec.senders.slice(0, -1).includes(uid)
+          ? undefined
+          : $inc(row.repeatTime)
+      }]),
+      // 更新复读发起者的复读数据
+      ctx.database.upsert('w-repeat-user', row => [{
+        uid: rec.senders[0],
+        beRepeatedCount: $inc(row.beRepeatedCount),
+        beRepeatedTime: rec.senders.length === 2
+          ? $inc(row.beRepeatedTime)
+          : undefined
+      }])
+    ])
 
     // 处理挂起的复读
+    let didResume = false
     await procRecs('suspendedRecs', async rec => {
       // 如果当前消息构成复读，则恢复挂起的复读
-      if (isRepeating) {
+      if (isRepeating && ! didResume) {
+        const resumeCandidate = currentRec
         // 将挂起的复读记录分离为挂起信息和恢复的复读
         const [ suspension, resumed ] = pickOr(rec, [ 'suspendTime', 'resumeTime' ])
         // 添加挂起信息到恢复的复读中
@@ -669,70 +703,65 @@ export async function apply(ctx: Context, config: Config) {
         await ctx.database.remove('w-repeat-record', resumed.id)
         rec.deleted = true
 
-        // 用恢复的复读替换当前复读
-        isNewRec = false
-        runtime.currentRec = omit(resumed, [ 'id' ])
+        // 恢复用的当前候选已经完成使命，不能继续留在队列中再次落库。
+        runtime.queuedRecs = runtime.queuedRecs.filter(rec => rec !== resumeCandidate)
+        currentRec = runtime.currentRec = omit(resumed, [ 'id' ])
+        didResume = true
       }
     })
 
     // 如果发生复读
     if (isRepeating) {
-      // 将当前用户加入运行时的发送者列表中
-      currentRec.senders.push(uid)
-      // 更新回复
-      updateRecQuote(session, currentRec)
-    }
-    // 当前复读的复读条数，大于 1 则为完整复读
-    const repeatCount = currentRec?.senders?.length ?? 0
-
-    // 如果发生了复读
-    if (isRepeating) {
-      // 如果是完整复读，则更新用户复读数据
-      if (repeatCount > 1) await Promise.all([
-        // 更新当前用户的复读数据
-        ctx.database.upsert('w-repeat-user', row => [{
-          uid,
-          repeatCount: $inc(row.repeatTime),
-          repeatTime: currentRec.senders.slice(0, -1).includes(uid)
-            ? undefined
-            : $inc(row.repeatTime)
-        }]),
-        // 更新复读发起者的复读数据
-        ctx.database.upsert('w-repeat-user', row => [{
-          uid: currentRec.senders[0],
-          beRepeatedCount: $inc(row.beRepeatedCount),
-          beRepeatedTime: currentRec.senders.length === 2
-            ? $inc(row.beRepeatedTime)
-            : undefined
-        }])
-      ])
+      // procRecs 已经把恢复消息加入 resumed，普通复读才需要在这里追加。
+      if (! didResume) {
+        currentRec.senders.push(uid)
+        updateRecQuote(session, currentRec)
+      }
+      if (currentRec.senders.length > 1) await updateRepeatStats(currentRec)
     }
     else {
+      const interruptedRec = currentRec
+      const interruptedRepeatCount = interruptedRec?.senders?.length ?? 0
+      let isNewRec = true
+      let activatedRec: RepeatQueuedRecord | undefined
+
       // 处理未激活的复读
       await procRecs('queuedRecs', async rec => {
+        // 队列按新到旧排列；同内容只激活最新候选，其余重复候选直接淘汰。
+        if (activatedRec) {
+          rec.deleted = true
+          return
+        }
         // 用新激活的复读替换当前复读
         isNewRec = false
-        currentRec = runtime.currentRec = rec
+        activatedRec = rec
       })
+      if (activatedRec) {
+        runtime.queuedRecs = runtime.queuedRecs.filter(rec => rec !== activatedRec)
+        currentRec = runtime.currentRec = activatedRec
+        if (currentRec.senders.length > 1) await updateRepeatStats(currentRec)
+      }
 
-      // 如果当前复读是完整复读（即发送人数大于 1），则被打断
-      if (repeatCount > 1) {
+      // 激活候选会替换 currentRec，因此必须显式保存先前真正被打断的记录。
+      if (interruptedRepeatCount > 1) {
+        runtime.queuedRecs = runtime.queuedRecs.filter(rec => rec !== interruptedRec)
         // 记录打断者和复读结束时间
-        currentRec.interrupter = uid
-        currentRec.endTime = Date.now()
+        interruptedRec.interrupter = uid
+        interruptedRec.endTime = Date.now()
+
+        // 先生成派生字段再创建记录，避免数据库驱动先序列化记录，导致 OCR
+        // 和分词结果随机丢失。
+        if (settings.enableOcr && tesseractWorker) await updateImageText(interruptedRec)
+        if (settings.enableSegmentation && jieba) await updateWords(interruptedRec)
 
         const [ old ] = await Promise.all([
           // 将运行时作为新复读记录写入复读记录表
-          ctx.database.create('w-repeat-record', omit(currentRec, [ 'unrelatedCount', 'deleted' ])),
+          ctx.database.create('w-repeat-record', omit(interruptedRec, [ 'unrelatedCount', 'deleted' ])),
           // 更新打断者复读用户数据
           ctx.database.upsert('w-repeat-user', row => [{
             uid,
             interruptTime: $inc(row.interruptTime)
-          }]),
-          // 识别图片中文字
-          (settings.enableOcr && tesseractWorker) ? updateImageText(currentRec) : undefined,
-          // 分词
-          (settings.enableSegmentation && jieba) ? updateWords(currentRec) : undefined
+          }])
         ])
 
         // 如果允许挂起，挂起被打断的复读
@@ -822,10 +851,11 @@ export async function apply(ctx: Context, config: Config) {
       if (! isGlobal) gid ||= session.gid
 
       const [ sortMethod = 'count', sortDirection = 'desc' ] = options.sort.split(':') as [
-        'count' | 'tps' | 'length' | 'startTime', Direction
+        'count' | 'tps' | 'startTime', Direction
       ]
-      const isFiltered = ([ 'filter', 'starter', 'repeater', 'interrupter' ] satisfies (keyof typeof options)[])
-        .some(name => name in options)
+      const isFiltered = Boolean(jsfilter || ([
+        'filter', 'image', 'starter', 'repeater', 'interrupter'
+      ] satisfies (keyof typeof options)[]).some(name => name in options))
 
       // TODO: wait for row destruction
       const reserveProjection = getReserveProjection<RepeatRecord>([
@@ -894,8 +924,7 @@ export async function apply(ctx: Context, config: Config) {
       const { [sortMethod]: sortMethodText } = {
         'count': '复读次数',
         'tps': '每秒复读次数',
-        'startTime': '开始时间',
-        'length': '消息长度'
+        'startTime': '开始时间'
       } satisfies Record<typeof sortMethod, string>
       const { [sortDirection]: sortDirectionText } = {
         'desc': '降序',
@@ -943,7 +972,7 @@ export async function apply(ctx: Context, config: Config) {
         ` + '\n\n'
         : ''
       ) + (! isFiltered && topNum > 0
-        ? dedent`   
+        ? dedent`
           ${topText('参与复读', topRepeaters)}
           ${topText('发起复读', topStarters)}
           ${topText('打断复读', topInterrupters)}
@@ -953,7 +982,7 @@ export async function apply(ctx: Context, config: Config) {
 
       return text
     })
-  
+
   ctx.command('repeat.word', '查看群复读词频统计')
     .alias('repeat.w')
 
@@ -982,7 +1011,7 @@ export async function apply(ctx: Context, config: Config) {
           word: all ? {} : { $not: { $in: settings.segmentationWordBlacklist } },
           tag: {
             $and: [
-              all ? {} : { $not: { $in: settings.segmentationWordBlacklist } },
+              all ? {} : { $not: { $in: settings.segmentationTagBlacklist } },
               tags ? { $in: tags } : {}
             ]
           }
@@ -990,7 +1019,7 @@ export async function apply(ctx: Context, config: Config) {
         .orderBy('count', 'desc')
         .limit(topCount)
         .execute()
-      
+
       const filterText = tags
         ? `词性为 ${tags.join(' | ')} 的`
         : ''
@@ -1011,13 +1040,18 @@ export async function apply(ctx: Context, config: Config) {
     .option('all', '-a 显示所有词（包括黑名单中的）')
     .action(async ({
       session: { guildId, gid },
-      options: { guild: assignedGid, global: isGlobal, top: topCount }
+      options: { guild: assignedGid, global: isGlobal, top: topCount, all }
     }) => {
       if (! guildId && ! assignedGid && ! isGlobal) return '请在群内调用'
       if (assignedGid) gid = assignedGid
+      const settings = getGuildSettings(gid)
 
       const tags = await ctx.database
         .select('w-repeat-word')
+        .where({
+          gid: isGlobal ? {} : gid,
+          tag: all ? {} : { $not: { $in: settings.segmentationTagBlacklist } }
+        })
         .groupBy('tag', {
           count: row => $.sum(row.count)
         })
@@ -1060,6 +1094,7 @@ export async function apply(ctx: Context, config: Config) {
           ...parseDuration(options.duration)
         })
         .execute()
+      if (! recs.length) return '指定时间内还没有复读记录。'
 
       recs.forEach(rec => {
         const starter = rec.senders[0]
@@ -1074,11 +1109,17 @@ export async function apply(ctx: Context, config: Config) {
 
       type GraphSeriesOption = echarts.RegisteredSeriesOption['graph']
 
-      const starters = Object.entries(starterDict)
-        .map(([ uid, { name, count } ]) => ({ uid, name, count }))
-      const starterNum = starters.length
-      const maxRepeatedCount = Math.max(...starters.map(({ count }) => count))
-      const nodes = starters
+      const users = [ ...new Set([
+        ...Object.keys(starterDict),
+        ...Object.keys(sendMat)
+      ]) ].map(uid => ({
+        uid,
+        name: starterDict[uid]?.name ?? getMemberName(memberDict, uid),
+        count: starterDict[uid]?.count ?? 0
+      }))
+      const userNum = users.length
+      const maxRepeatedCount = Math.max(1, ...users.map(({ count }) => count))
+      const nodes = users
         .map<GraphSeriesOption['data'][number]>(({ uid, name, count }, i) => ({
           name: uid,
           label: {
@@ -1089,7 +1130,7 @@ export async function apply(ctx: Context, config: Config) {
             shadowColor: 'transparent',
             fontSize: 22
           },
-          symbolSize: count / maxRepeatedCount * 150,
+          symbolSize: 30 + count / maxRepeatedCount * 120,
           category: String(i),
         }))
 
@@ -1140,7 +1181,7 @@ export async function apply(ctx: Context, config: Config) {
             rotateLabel: true
           },
           categories: Array
-            .from({ length: starterNum })
+            .from({ length: userNum })
             .map((_, i) => ({ name: String(i) })),
           data: nodes,
           links
@@ -1236,7 +1277,9 @@ export async function apply(ctx: Context, config: Config) {
       month = date.format('YYYY-MM')
 
       const days = getDaysOfMonth(date)
-      const today = date.format('DD')
+      const today = dayjs().format('YYYY-MM') === month
+        ? dayjs().format('DD')
+        : undefined
 
       type TopType = 'repeater' | 'starter' | 'interrupter'
       const topTypeText = {
@@ -1256,8 +1299,8 @@ export async function apply(ctx: Context, config: Config) {
           .select('w-repeat-calendar')
           .where({
             gid,
-            month: 'YYYY-MM',
-            day: { $ne: today },
+            month,
+            ...(today ? { day: { $ne: today } } : {}),
             [idKey]: { $ne: null }
           })
           .project({
@@ -1267,9 +1310,8 @@ export async function apply(ctx: Context, config: Config) {
             count: row => row[countKey]
           })
           .execute()
-        const missingDays = exclude(days, dataExists.map(rec => rec.month))
+        const missingDays = exclude(days, dataExists.map(rec => rec.day))
 
-        let maxCount = 0
         const [ memberDict, [ dataCreated, dataToUpsert ] ] = await Promise.all([
           getMemberDict(session, gid.split(':')[1]),
           unzipPromise(Promise.all(missingDays.map(async day => {
@@ -1282,7 +1324,7 @@ export async function apply(ctx: Context, config: Config) {
             })
             if (! recs.length) return [
               { month, day, id: null, count: null },
-              { month, day }
+              { gid, month, day }
             ]
             const candidatorDict: Record<string, number> = {}
             const inc = safeInc(candidatorDict)
@@ -1294,15 +1336,15 @@ export async function apply(ctx: Context, config: Config) {
             const [ [ id, count ] ] = Object
               .entries(candidatorDict)
               .sort(([, count1 ], [, count2 ]) => count2 - count1)
-            if (count > maxCount) maxCount = count
             return [
               { month, day, id, count },
-              { month, day, [idKey]: id, [countKey]: count }
+              { gid, month, day, [idKey]: id, [countKey]: count }
             ] as const
           })))
         ])
 
         const data = [ ...dataExists, ...dataCreated ]
+        const maxCount = Math.max(0, ...data.map(({ count }) => count ?? 0))
 
         const CELL_SIZE = 80
 
@@ -1342,12 +1384,12 @@ export async function apply(ctx: Context, config: Config) {
               const id = api.value('id') as string
               const count = api.value('count') as number
               const [ x, y ] = api.coord(`${month}-${day}`)
-              
+
               type CustomSeriesOption = echarts.RegisteredSeriesOption['custom']
               type CustomGroupOption = ReturnType<CustomSeriesOption['renderItem']> & { type: 'group' }
 
               const children: CustomGroupOption['children'] = [
-                id ? {
+                options.avatar && id ? {
                   type: 'image',
                   style: {
                     x: x - CELL_SIZE / 2 + 4,
@@ -1411,13 +1453,12 @@ export async function apply(ctx: Context, config: Config) {
 
       // TODO: Optimize
       if (options.type === 'a' || options.type === 'all') {
-        const outputs = await Promise.all(([ 'repeater', 'starter', 'interrupter' ] satisfies TopType[])
-          .map(async (topType) => {
-            const { output, dataToUpsert } = await getCalendar(topType)
-            await ctx.database.upsert('w-repeat-calendar', dataToUpsert)
-            return output
-          })
-        )
+        const outputs: string[] = []
+        for (const topType of [ 'repeater', 'starter', 'interrupter' ] satisfies TopType[]) {
+          const { output, dataToUpsert } = await getCalendar(topType)
+          await ctx.database.upsert('w-repeat-calendar', dataToUpsert)
+          outputs.push(output)
+        }
         const output = h('message', { forward: true }, outputs.map(output => h('message', h.parse(output))))
         return output
       }
@@ -1432,10 +1473,7 @@ export async function apply(ctx: Context, config: Config) {
       } as const)[options.type]
 
       const { output, dataToUpsert } = await getCalendar(topType)
-      await ctx.database.upsert('w-repeat-calendar', dataToUpsert.map(day => ({
-        ...day,
-        gid
-      })))
+      await ctx.database.upsert('w-repeat-calendar', dataToUpsert)
       return output
     })
 
@@ -1496,8 +1534,8 @@ export async function apply(ctx: Context, config: Config) {
         打断时间：${timeText(rec.endTime)}
         挂起情况：${suspensionText}
         内容：${options.delete ? '[已删除]' : content}`
-        + (rec.images.length || options.ocr
-          ? `\n图片识别结果：${options.ocr ? '[新识别]' : ''}\n${rec.images
+        + ((rec.images?.length ?? 0) || options.ocr
+          ? `\n图片识别结果：${options.ocr ? '[新识别]' : ''}\n${(rec.images ?? [])
             .map(({ text }, i) => `${i + 1}. ${text.trim() || '[未识别到文字]'}`)
             .join('\n')
           }`
@@ -1547,11 +1585,20 @@ export async function apply(ctx: Context, config: Config) {
         session.bot.getGuildMember(session.guildId, session.userId),
         session.observeUser([ 'authority' ]),
       ])
-      if (user.authority < 3 && ! member.roles.some(role => [ 'admin', 'owner' ].includes(role))) {
+      const isGuildAdmin = member.roles.some(role =>
+        [ role.id, role.name ].some(value => value === 'admin' || value === 'owner')
+      )
+      if (user.authority < 3 && ! isGuildAdmin) {
         return '只有群主、管理员或 Koishi 管理员（权限等级 ≥ 3）可以管理群复读设置。'
       }
 
-      const settings = config.guildSettings[session.gid] ??= config.globalSettings
+      // 群设置必须使用独立对象；直接复用全局设置会令群设置修改污染全局配置。
+      const settings = config.guildSettings[session.gid] ??= {
+        ...config.globalSettings,
+        repeatBlacklist: [ ...config.globalSettings.repeatBlacklist ],
+        segmentationWordBlacklist: [ ...config.globalSettings.segmentationWordBlacklist ],
+        segmentationTagBlacklist: [ ...config.globalSettings.segmentationTagBlacklist ]
+      }
 
       const displaySettingItem = (symbol: string, desc) => (key: string) => (
         `${key}${desc ? ` /* ${RepeatSettings.dict[key].meta.description} */` : ''}${symbol}${JSON.stringify(settings[key])}`
@@ -1586,7 +1633,7 @@ export async function apply(ctx: Context, config: Config) {
         return `无法解析设置值 '${value}'`
       }
     })
-    
+
   ctx.command('repeat.admin.regen-user-table', '重建复读用户表', { authority: 4 })
     .action(async ({ session }) => {
       await session.send('正在根据复读记录重建用户数据表……')
@@ -1616,7 +1663,7 @@ export async function apply(ctx: Context, config: Config) {
           }
         })
 
-        getUser(rec.interrupter).interruptTime ++
+        if (rec.interrupter) getUser(rec.interrupter).interruptTime ++
       })
       const writeResult = await ctx.database.upsert('w-repeat-user', () => Object.values(users))
       return `已重建 ${writeResult.inserted} 条用户数据`
@@ -1627,7 +1674,10 @@ export async function apply(ctx: Context, config: Config) {
       if (! tesseractWorker) return 'Tesseract 未加载，无法识别图片中文字'
       await session.send('开始查询数据库……')
       const recs = await ctx.database.get('w-repeat-record', row => $.gt($.length(row.images), 0))
-      const imageCount = recs.reduce((count, rec) => count + rec.images.filter(x => x !== null).length, 0)
+      const imageCount = recs.reduce(
+        (count, rec) => count + (rec.images ?? []).filter(x => x !== null).length,
+        0
+      )
       await session.send(`正在识别 ${recs.length} 条复读记录中的 ${imageCount} 张图片……`)
       await Promise.all(recs.map(updateImageText))
     }))
