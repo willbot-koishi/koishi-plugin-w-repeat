@@ -3,12 +3,61 @@ import { afterEach, describe, it } from 'node:test'
 
 import memory from '@koishijs/plugin-database-memory'
 import Mock from '@koishijs/plugin-mock'
-import { Context, type Plugin } from 'koishi'
+import { Context, Service, type Plugin, type Session } from 'koishi'
+import type { SavedMessage } from 'koishi-plugin-w-message-db'
 
 import * as repeatPlugin from '../src'
 import type { Config } from '../src'
 
 const fixtures: Array<{ ctx: Context, mock: { dispose(): boolean } }> = []
+
+class MessageDbMock extends Service {
+  messages = new Map<string, SavedMessage>()
+  references = new Map<string, Set<string>>()
+
+  constructor(ctx: Context) {
+    super(ctx, 'messageDb')
+  }
+
+  async captureMessage(session: Session): Promise<SavedMessage> {
+    const key = JSON.stringify([session.platform, session.guildId, session.messageId])
+    let message = this.messages.get(key)
+    if (! message) {
+      message = {
+        key,
+        id: session.messageId,
+        platform: session.platform,
+        guildId: session.guildId,
+        userId: session.userId,
+        username: session.username,
+        content: session.content,
+        timestamp: session.timestamp,
+        quoteId: session.quote?.id,
+        segmented: false,
+        messageTypeMask: 1,
+      }
+      this.messages.set(key, message)
+    }
+    return message
+  }
+
+  async getMessagesByKeys(keys: readonly string[]) {
+    return keys.flatMap(key => {
+      const message = this.messages.get(key)
+      return message ? [message] : []
+    })
+  }
+
+  async getWordsByMessageKeys() { return [] }
+  async retainMessages(owner: string, keys: readonly string[]) {
+    this.references.set(owner, new Set(keys))
+  }
+
+  async releaseMessages(owner: string) {
+    const removed = this.references.delete(owner)
+    return Number(removed)
+  }
+}
 
 afterEach(async () => {
   await Promise.all(fixtures.splice(0).map(async ({ ctx, mock }) => {
@@ -20,6 +69,7 @@ afterEach(async () => {
 async function createContext(overrides: Partial<Config['globalSettings']> = {}) {
   const ctx = new Context()
   ctx.plugin(memory)
+  ctx.plugin(MessageDbMock)
   ctx.plugin(repeatPlugin, {
     isPrepend: false,
     displayLength: 25,
@@ -44,6 +94,21 @@ async function createContext(overrides: Partial<Config['globalSettings']> = {}) 
   fixtures.push({ ctx, mock })
   await ctx.start()
   return ctx
+}
+
+async function getRecords(ctx: Context, content?: string) {
+  const records = await ctx.database.get('w-repeat-record-v2', {})
+  if (! content) return records
+  const messages = (ctx.messageDb as unknown as MessageDbMock).messages
+  return records.filter(record => messages.get(record.starterMessageKey)?.content === content)
+}
+
+async function getRecordSenders(ctx: Context, recordId: number) {
+  const rows = await ctx.database
+    .select('w-repeat-message-v2', { recordId })
+    .orderBy('index')
+    .execute()
+  return rows.map(row => `${row.platform}:${row.userId}`)
 }
 
 describe('repeat tracking', () => {
@@ -75,9 +140,9 @@ describe('repeat tracking', () => {
       await ctx.mock.client(uid, 'group').receive(content, 0)
     }
 
-    const records = await ctx.database.get('w-repeat-record', { content: 'A' })
+    const records = await getRecords(ctx, 'A')
     assert.equal(records.length, 1)
-    assert.deepEqual(records[0].senders, [ 'mock:u1', 'mock:u2' ])
+    assert.deepEqual(await getRecordSenders(ctx, records[0].id), [ 'mock:u1', 'mock:u2' ])
   })
 
   it('merges a suspended repeat after the content repeats again', async () => {
@@ -93,12 +158,14 @@ describe('repeat tracking', () => {
       await ctx.mock.client(uid, 'group').receive(content, 0)
     }
 
-    const records = await ctx.database.get('w-repeat-record', { content: 'A' })
+    const records = await getRecords(ctx, 'A')
     assert.equal(records.length, 1)
-    assert.deepEqual(records[0].senders, [
+    assert.deepEqual(await getRecordSenders(ctx, records[0].id), [
       'mock:u1', 'mock:u2', 'mock:u4', 'mock:u5'
     ])
-    assert.equal(records[0].interrupter, 'mock:u6')
+    const interrupter = (ctx.messageDb as unknown as MessageDbMock)
+      .messages.get(records[0].interrupterMessageKey)
+    assert.equal(`${interrupter.platform}:${interrupter.userId}`, 'mock:u6')
     assert.equal(records[0].suspensions.length, 1)
   })
 
@@ -113,15 +180,51 @@ describe('repeat tracking', () => {
       await ctx.mock.client(uid, 'group').receive(content, 0)
     }
 
-    const records = await ctx.database.get('w-repeat-record', {})
+    const records = await getRecords(ctx)
     assert.equal(records.length, 1)
-    assert.equal(records[0].content, 'B')
-    assert.deepEqual(records[0].senders, [ 'mock:u2', 'mock:u3' ])
-    assert.equal(records[0].interrupter, 'mock:u4')
+    const starter = (ctx.messageDb as unknown as MessageDbMock)
+      .messages.get(records[0].starterMessageKey)
+    const interrupter = (ctx.messageDb as unknown as MessageDbMock)
+      .messages.get(records[0].interrupterMessageKey)
+    assert.equal(starter.content, 'B')
+    assert.deepEqual(await getRecordSenders(ctx, records[0].id), [ 'mock:u2', 'mock:u3' ])
+    assert.equal(`${interrupter.platform}:${interrupter.userId}`, 'mock:u4')
 
     const [ repeater ] = await ctx.database.get('w-repeat-user', { uid: 'mock:u4' })
     assert.equal(repeater.repeatCount, 1)
     assert.equal(repeater.repeatTime, 1)
+  })
+
+  it('reads and deletes message-backed records through commands', async () => {
+    const ctx = await createContext()
+    const starter = ctx.mock.client('starter', 'group')
+    const repeater = ctx.mock.client('repeater', 'group')
+    const interrupter = ctx.mock.client('interrupter', 'group')
+    Object.assign(starter.bot, {
+      getGuildMemberList: async () => ({ data: [] }),
+      getGuild: async (id: string) => ({ id, name: 'Test Guild' }),
+    })
+    await ctx.mock.initUser('starter', 4)
+    await starter.receive('saved in message-db', 0)
+    await repeater.receive('saved in message-db', 0)
+    await interrupter.receive('different', 0)
+
+    const [record] = await ctx.database.get('w-repeat-record-v2', {})
+    const service = ctx.messageDb as unknown as MessageDbMock
+    assert.equal(service.references.has(`w-repeat:${record.id}`), true)
+
+    const [stats] = await starter.receive('repeat.stat -d all', 1)
+    assert.match(stats, /saved in message-db/)
+
+    const [detail] = await starter.receive(`repeat.record ${record.id}`, 1)
+    assert.match(detail, /saved in message-db/)
+    assert.match(detail, /2 个/)
+
+    const [deleted] = await starter.receive(`repeat.record ${record.id} -d`, 1)
+    assert.match(deleted, /\[已删除\]/)
+    assert.deepEqual(await ctx.database.get('w-repeat-record-v2', { id: record.id }), [])
+    assert.deepEqual(await ctx.database.get('w-repeat-message-v2', { recordId: record.id }), [])
+    assert.equal(service.references.has(`w-repeat:${record.id}`), false)
   })
 })
 

@@ -6,25 +6,35 @@ import {
   Dict,
   Selection,
   Awaitable,
-  Update
+  Update,
+  type Tables,
 } from 'koishi'
 import { type GuildMember } from '@satorijs/protocol'
 
 import {} from '@koishijs/plugin-help'
 import {} from 'koishi-plugin-w-option-conflict'
 import { type echarts } from 'koishi-plugin-w-echarts'
+import type { SavedMessage } from 'koishi-plugin-w-message-db'
 import {} from 'koishi-plugin-w-tesseract'
 import { type Jieba, type Tag } from 'koishi-plugin-w-jieba'
 
 import dedent from 'dedent'
 import dayjs, { type Dayjs } from 'dayjs'
 
-import { extendRepeatV2Models } from './model-v2'
+import { extendRepeatV2Models, type RepeatRecordV2 } from './model-v2'
+import {
+  createRepeatTrackerState,
+  suspendPersistedCandidate,
+  transitionRepeat,
+  type RepeatCandidate,
+  type RepeatTrackerState,
+  type TrackedMessage,
+} from './tracker'
 
 export const name = 'w-repeat'
 
 export const inject = {
-  required: ['database'],
+  required: ['database', 'messageDb'],
   optional: ['echarts', 'tesseract', 'jieba']
 }
 
@@ -52,10 +62,10 @@ export const RepeatSettings: z<RepeatSettings> = z.object({
 
   repeatBlacklist: z.array(z.string()).description('复读内容黑名单'),
 
-  doProceedImage: z.boolean().default(false).description('是否处理图片（会使用较多数据库空间）'),
-  enableOcr: z.boolean().default(true).description('是否自动识别复读消息图片中文字'),
+  doProceedImage: z.boolean().default(false).description('旧版图片处理开关（新记录由 message-db 转存资源）'),
+  enableOcr: z.boolean().default(true).description('是否为旧版复读记录生成 OCR 结果'),
 
-  enableSegmentation: z.boolean().default(true).description('是否对复读消息分词'),
+  enableSegmentation: z.boolean().default(true).description('是否为旧版复读记录分词（新记录使用 message-db 分词）'),
   segmentationWordBlacklist: z.array(z.string()).description('复读词频统计中不显示的词'),
   segmentationTagBlacklist: z.array(z.string()).description('复读词频统计中不显示的词性'),
 })
@@ -374,13 +384,6 @@ export async function apply(ctx: Context, config: Config) {
   const omit = <T extends {}, K extends keyof T>(x: T, keys: K[]): Omit<T, K> =>
     Object.fromEntries(Object.entries(x).filter(([ k ]) => ! keys.includes(k as any))) as any
 
-  const pickOr = <T extends {}, K extends keyof T>(x: T, keys: K[]): [ Pick<T, K>, Omit<T, K> ] => {
-    const xPick = {} as Pick<T, K>
-    const xOmit = {} as Omit<T, K>
-    Object.keys(x).forEach(k => (keys.includes(k as any) ? xPick : xOmit)[k] = x[k])
-    return [ xPick, xOmit ]
-  }
-
   const safeInc = <K extends keyof any>(o: Record<K, number>) => (k: K) => {
     o[k] ??= 0
     o[k] ++
@@ -470,24 +473,7 @@ export async function apply(ctx: Context, config: Config) {
 
   const $inc = (expr: $.Expr) => $.add(expr, 1)
 
-  // Stream
-  const streamToBuffer = async (stream: ReadableStream<Uint8Array>): Promise<Buffer> => {
-    const buffers: Uint8Array[] = []
-    for await (const data of stream) buffers.push(data)
-    return Buffer.concat(buffers)
-  }
-
   // Repeat
-  const isSameImages = (images1: RepeatImage[], images2: RepeatImage[]): boolean =>
-      ! new Set([ ...images1, ...images2 ]).has(null)
-    &&  images1.length === images2.length
-    &&  images1.every((b1, i) => b1.b64 === images2[i].b64)
-
-  const isSameMessage = (message1: RepeatMessage, message2: RepeatMessage) =>
-      message1 && message2
-    &&  message1.content === message2.content
-    &&  isSameImages(message1.images ?? [], message2.images ?? [])
-
   const updateImageText = async (rec: RepeatRecord | RepeatQueuedRecord) => {
     const images = rec.images ??= []
 
@@ -511,35 +497,6 @@ export async function apply(ctx: Context, config: Config) {
     if ('id' in rec) await ctx.database.set('w-repeat-record', { id: rec.id }, { words })
 
     return words
-  }
-
-  const createCurrentRec = (gid: string): RepeatQueuedRecord => ({
-    gid,
-    content: undefined,
-    images: undefined,
-    quote: undefined,
-    senders: undefined,
-    startTime: undefined,
-    endTime: undefined,
-    interrupter: undefined,
-    suspensions: [],
-    unrelatedCount: 0
-  })
-
-  const updateRecQuote = (session: Session, rec: RepeatQueuedRecord) => {
-    if (! session.quote) return
-    if (! rec.quote) {
-      rec.quote = {
-        valid: true,
-        ...pick(session.quote, [ 'id', 'content' ])
-      }
-      return
-    }
-    if (! rec.quote.valid) return
-    if (rec.quote.id === session.quote.id) return
-    rec.quote = {
-      valid: false
-    }
   }
 
   const unescapeMessage = (
@@ -570,240 +527,280 @@ export async function apply(ctx: Context, config: Config) {
     return content
   }
 
-  // 复读中间件
-  const runtimes: Record<string, RepeatRuntime> = {}
-  ctx.middleware(async (session, next) => {
-    // 只处理群内消息
-    const { content: originalContent, gid, uid } = session
-    if (! session.guildId) return next()
+  type UnifiedRepeatRecord = RepeatRecord & {
+    storageVersion: 1 | 2
+    hasImage: boolean
+  }
 
-    // 依次检查群和全局是否启用复读
+  const hydrateV2Records = async (records: RepeatRecordV2[]): Promise<UnifiedRepeatRecord[]> => {
+    if (! records.length) return []
+    const recordIds = records.map(record => record.id)
+    const rows: Tables['w-repeat-message-v2'][] = []
+    for (let index = 0; index < recordIds.length; index += 500) {
+      rows.push(...await ctx.database.get('w-repeat-message-v2', {
+        recordId: { $in: recordIds.slice(index, index + 500) },
+      }))
+    }
+    const keys = [...new Set([
+      ...records.flatMap(record => [record.starterMessageKey, record.interrupterMessageKey]),
+      ...rows.map(row => row.messageKey),
+    ].filter((key): key is string => !! key))]
+    const [messages, words] = await Promise.all([
+      ctx.messageDb.getMessagesByKeys(keys),
+      ctx.messageDb.getWordsByMessageKeys(records.map(record => record.starterMessageKey)),
+    ])
+    const messageMap = new Map(messages.map(message => [message.key, message]))
+    const rowsByRecord = new Map<number, typeof rows>()
+    for (const row of rows) {
+      const recordRows = rowsByRecord.get(row.recordId) ?? []
+      recordRows.push(row)
+      rowsByRecord.set(row.recordId, recordRows)
+    }
+    const wordsByMessage = new Map<string, typeof words>()
+    for (const word of words) {
+      const messageWords = wordsByMessage.get(word.messageKey) ?? []
+      messageWords.push(word)
+      wordsByMessage.set(word.messageKey, messageWords)
+    }
+
+    return records.flatMap(record => {
+      const starter = messageMap.get(record.starterMessageKey)
+      if (! starter) {
+        ctx.logger.warn('repeat record %d references a missing starter message', record.id)
+        return []
+      }
+      const recordRows = (rowsByRecord.get(record.id) ?? []).sort((a, b) => a.index - b.index)
+      const interrupter = messageMap.get(record.interrupterMessageKey)
+      return [{
+        id: record.id,
+        gid: `${record.platform}:${record.guildId}`,
+        content: starter.content,
+        senders: recordRows.map(row => `${row.platform}:${row.userId}`),
+        startTime: record.startTime,
+        endTime: record.endTime,
+        interrupter: interrupter ? `${interrupter.platform}:${interrupter.userId}` : '',
+        suspensions: record.suspensions.map(({ suspendTime, resumeTime }) => ({
+          suspendTime,
+          resumeTime,
+        })),
+        words: wordsByMessage.get(record.starterMessageKey),
+        storageVersion: 2,
+        hasImage: /<(?:img|image)\b/i.test(starter.content),
+      }]
+    })
+  }
+
+  const getV2Records = async (
+    gid?: string,
+    duration: Record<string, any> = {},
+  ) => {
+    const query: Record<string, any> = { ...duration }
+    if (gid) {
+      const [platform, guildId] = splitWithLimit(gid, ':', 2)
+      query.platform = platform
+      query.guildId = guildId
+    }
+    return hydrateV2Records(await ctx.database.get('w-repeat-record-v2', query))
+  }
+
+  const asUnifiedV1 = (record: RepeatRecord): UnifiedRepeatRecord => ({
+    ...record,
+    storageVersion: 1,
+    hasImage: !! record.images?.length,
+  })
+
+  // New records use message-db as their only content and asset source.
+  const trackerStates = new Map<string, RepeatTrackerState>()
+  const guildTasks = new Map<string, Promise<void>>()
+  const skippedCaptureWarnings = new Set<string>()
+  let nextRecordId: number | undefined
+  let allocationTask: Promise<void> = Promise.resolve()
+
+  const enqueueGuild = async <T>(gid: string, task: () => Promise<T>): Promise<T> => {
+    const previous = guildTasks.get(gid) ?? Promise.resolve()
+    const current = previous.catch(() => {}).then(task)
+    const tail = current.then(() => {}, () => {})
+    guildTasks.set(gid, tail)
+    try {
+      return await current
+    }
+    finally {
+      if (guildTasks.get(gid) === tail) guildTasks.delete(gid)
+    }
+  }
+
+  const allocateRecordId = async () => {
+    let allocated: number
+    const task = allocationTask.then(async () => {
+      if (nextRecordId === undefined) {
+        const [legacy, current] = await Promise.all([
+          ctx.database.select('w-repeat-record')
+            .orderBy('id', 'desc').limit(1).project(['id']).execute(),
+          ctx.database.select('w-repeat-record-v2')
+            .orderBy('id', 'desc').limit(1).project(['id']).execute(),
+        ])
+        nextRecordId = Math.max(legacy[0]?.id ?? 0, current[0]?.id ?? 0)
+      }
+      allocated = ++ nextRecordId
+    })
+    allocationTask = task.catch(() => {})
+    await task
+    return allocated
+  }
+
+  const getReferencedKeys = (candidate: RepeatCandidate) => [...new Set([
+    ...candidate.messages.map(message => message.key),
+    candidate.interrupter?.key,
+    ...candidate.suspensions.flatMap(suspension => [
+      suspension.suspendMessageKey,
+      suspension.resumeMessageKey,
+    ]),
+  ].filter((key): key is string => !! key))]
+
+  const persistCandidate = async (candidate: RepeatCandidate): Promise<number> => {
+    while (true) {
+      const id = await allocateRecordId()
+      const owner = `w-repeat:${id}`
+      try {
+        await ctx.database.create('w-repeat-record-v2', {
+          id,
+          platform: candidate.messages[0].platform,
+          guildId: candidate.messages[0].guildId,
+          starterMessageKey: candidate.messages[0].key,
+          interrupterMessageKey: candidate.interrupter?.key,
+          startTime: candidate.startTime,
+          endTime: candidate.endTime,
+          suspensions: candidate.suspensions,
+        })
+      }
+      catch (error) {
+        if ((error as any)?.code === 'duplicate-entry') {
+          nextRecordId = undefined
+          continue
+        }
+        throw error
+      }
+
+      try {
+        await ctx.database.upsert('w-repeat-message-v2', candidate.messages.map((message, index) => ({
+          recordId: id,
+          index,
+          messageKey: message.key,
+          platform: message.platform,
+          userId: message.userId,
+        })))
+        await ctx.messageDb.retainMessages(owner, getReferencedKeys(candidate))
+        return id
+      }
+      catch (error) {
+        await Promise.allSettled([
+          ctx.database.remove('w-repeat-message-v2', { recordId: id }),
+          ctx.database.remove('w-repeat-record-v2', { id }),
+          ctx.messageDb.releaseMessages(owner),
+        ])
+        throw error
+      }
+    }
+  }
+
+  const removePersistedCandidate = async (id: number) => {
+    await ctx.database.remove('w-repeat-message-v2', { recordId: id })
+    await ctx.database.remove('w-repeat-record-v2', { id })
+    await ctx.messageDb.releaseMessages(`w-repeat:${id}`)
+  }
+
+  const toTrackedMessage = (message: SavedMessage): TrackedMessage => ({
+    key: message.key,
+    platform: message.platform,
+    guildId: message.guildId,
+    userId: message.userId,
+    content: message.content,
+    timestamp: message.timestamp,
+    quoteId: message.quoteId,
+  })
+
+  const getMessageUid = (message: TrackedMessage) => `${message.platform}:${message.userId}`
+
+  const updateV2RepeatStats = async (candidate: RepeatCandidate, uid: string) => {
+    const senders = candidate.messages.map(getMessageUid)
+    await Promise.all([
+      ctx.database.upsert('w-repeat-user', row => [{
+        uid,
+        repeatCount: $inc(row.repeatCount),
+        repeatTime: senders.slice(0, -1).includes(uid)
+          ? undefined
+          : $inc(row.repeatTime),
+      }]),
+      ctx.database.upsert('w-repeat-user', row => [{
+        uid: senders[0],
+        beRepeatedCount: $inc(row.beRepeatedCount),
+        beRepeatedTime: senders.length === 2
+          ? $inc(row.beRepeatedTime)
+          : undefined,
+      }]),
+    ])
+  }
+
+  ctx.middleware(async (session, next) => {
+    if (! session.guildId) return next()
+    const { content: originalContent, gid, uid } = session
     const settings = getGuildSettings(gid)
     if (gid in config.guildSettings) {
       if (! config.guildSettings[gid]) return next()
     }
     else if (! settings.doWrite) return next()
 
-    // 过滤内容黑名单
-    if (settings.repeatBlacklist.some(re => {
+    if (settings.repeatBlacklist.some(pattern => {
       try {
-        return new RegExp(re).test(originalContent)
+        return new RegExp(pattern).test(originalContent)
       }
       catch (error) {
-        ctx.logger.warn('invalid repeat blacklist pattern %o: %s', re, error)
+        ctx.logger.warn('invalid repeat blacklist pattern %o: %s', pattern, error)
         return false
       }
-    }))
-      return next()
+    })) return next()
 
-    // 解析消息，处理图片
-    const imageSrcs: string[] = []
-    const content = h
-      .parse(originalContent)
-      .map(el => {
-        if (settings.doProceedImage && el.type === 'img') {
-          const src = el.attrs.src as string
-          imageSrcs.push(src)
-          return '@__KOISHI_IMG__@'
+    const reply = await enqueueGuild(gid, async () => {
+      const saved = await ctx.messageDb.captureMessage(session)
+      if (! saved) {
+        if (! skippedCaptureWarnings.has(gid)) {
+          skippedCaptureWarnings.add(gid)
+          ctx.logger.warn('message-db skipped messages from %s; repeat tracking is disabled there', gid)
         }
-        return el.toString()
+        return
+      }
+      skippedCaptureWarnings.delete(gid)
+
+      const state = trackerStates.get(gid) ?? createRepeatTrackerState()
+      trackerStates.set(gid, state)
+      const transition = transitionRepeat(state, toTrackedMessage(saved), {
+        maxUnrelatedCount: settings.maxUnrelatedCount,
+        repeatCount: settings.repeatCount,
       })
-      .join('')
-    const images: RepeatImage[] = await Promise.all(imageSrcs.map(async src => {
-      try {
-        const res = await fetch(src)
-        if (! res.ok) throw new Error(`HTTP ${res.status} ${res.statusText}`)
-        if (! res.body) throw new Error('response has no body')
-        const buffer = await streamToBuffer(res.body)
-        return {
-          b64: buffer.toString('base64'),
-          text: ''
-        }
+
+      if (transition.resumedRecordId !== undefined) {
+        await removePersistedCandidate(transition.resumedRecordId)
       }
-      catch (err) {
-        ctx.logger.error('failed to download image <%s>, %s', src, err instanceof Error ? err.stack : err)
-        return null
+      if (transition.stats) await updateV2RepeatStats(transition.stats, uid)
+      if (transition.completed) {
+        const id = await persistCandidate(transition.completed)
+        await ctx.database.upsert('w-repeat-user', row => [{
+          uid,
+          interruptTime: $inc(row.interruptTime),
+        }])
+        suspendPersistedCandidate(state, transition.completed, id)
       }
-    }))
 
-    // 定义当前消息：内容和图片
-    const thisMessage: RepeatMessage = { content, images }
-
-    // 获取本群复读运行时，若无则创建
-    const runtime = runtimes[gid] ??= {
-      currentRec: undefined,
-      queuedRecs: [],
-      suspendedRecs: []
-    }
-    let { currentRec } = runtime
-
-    // 判断当前消息是否为复读（即和当前复读内容相同）
-    const isRepeating = isSameMessage(thisMessage, currentRec)
-
-    // 处理某类复读
-    const procRecs = async <K extends 'suspendedRecs' | 'queuedRecs'>(
-      recsName: K,
-      onSame: (rec: RepeatRuntime[K][number]) => Promise<void>
-    ) => {
-      // 同一条消息可能命中多个旧候选。串行处理可确保只激活最新的候选，
-      // 避免多个回调并发覆盖 currentRec。
-      for (const rec of runtime[recsName]) {
-        // 当前消息与挂起复读内容相同
-        if (isSameMessage(thisMessage, rec)) {
-          // 将当前用户添加到复读发送者（暂不区分挂起状态、未激活状态下的发送者）
-          rec.senders.push(uid)
-          // 更新回复
-          updateRecQuote(session, rec)
-          // 重置无关消息计数器
-          rec.unrelatedCount = 0
-          // 调用相同消息处理函数
-          await onSame(rec)
-        }
-        else {
-          // 增加无关消息计数器
-          const count = ++ rec.unrelatedCount
-          // 如果无关消息多于阈值，将该复读标记为删除
-          if (count > settings.maxUnrelatedCount) rec.deleted = true
-        }
-      }
-      // 清理标记删除的复读
-      runtime[recsName] = runtime[recsName].filter(rec => ! rec.deleted) as RepeatRuntime[K]
-    }
-
-    const updateRepeatStats = async (rec: RepeatRecordBase) => Promise.all([
-      // 更新当前用户的复读数据
-      ctx.database.upsert('w-repeat-user', row => [{
-        uid,
-        repeatCount: $inc(row.repeatCount),
-        repeatTime: rec.senders.slice(0, -1).includes(uid)
-          ? undefined
-          : $inc(row.repeatTime)
-      }]),
-      // 更新复读发起者的复读数据
-      ctx.database.upsert('w-repeat-user', row => [{
-        uid: rec.senders[0],
-        beRepeatedCount: $inc(row.beRepeatedCount),
-        beRepeatedTime: rec.senders.length === 2
-          ? $inc(row.beRepeatedTime)
-          : undefined
-      }])
-    ])
-
-    // 处理挂起的复读
-    let didResume = false
-    await procRecs('suspendedRecs', async rec => {
-      // 如果当前消息构成复读，则恢复挂起的复读
-      if (isRepeating && ! didResume) {
-        const resumeCandidate = currentRec
-        // 将挂起的复读记录分离为挂起信息和恢复的复读
-        const [ suspension, resumed ] = pickOr(rec, [ 'suspendTime', 'resumeTime' ])
-        // 添加挂起信息到恢复的复读中
-        resumed.suspensions.push({
-          ...pick(suspension, [ 'suspendTime' ]),
-          resumeTime: Date.now()
-        })
-        // 将挂起的复读移出复读记录表，并标记从运行时中删除
-        await ctx.database.remove('w-repeat-record', resumed.id)
-        rec.deleted = true
-
-        // 恢复用的当前候选已经完成使命，不能继续留在队列中再次落库。
-        runtime.queuedRecs = runtime.queuedRecs.filter(rec => rec !== resumeCandidate)
-        currentRec = runtime.currentRec = omit(resumed, [ 'id' ])
-        didResume = true
-      }
+      if (! transition.shouldRepeat) return
+      return h('as-forward', { level: 'never' }, [
+        transition.current.quoteValid && transition.current.quoteId
+          ? h.quote(transition.current.quoteId)
+          : '',
+        ...h.parse(transition.current.messages[0].content),
+      ])
     })
 
-    // 如果发生复读
-    if (isRepeating) {
-      // procRecs 已经把恢复消息加入 resumed，普通复读才需要在这里追加。
-      if (! didResume) {
-        currentRec.senders.push(uid)
-        updateRecQuote(session, currentRec)
-      }
-      if (currentRec.senders.length > 1) await updateRepeatStats(currentRec)
-    }
-    else {
-      const interruptedRec = currentRec
-      const interruptedRepeatCount = interruptedRec?.senders?.length ?? 0
-      let isNewRec = true
-      let activatedRec: RepeatQueuedRecord | undefined
-
-      // 处理未激活的复读
-      await procRecs('queuedRecs', async rec => {
-        // 队列按新到旧排列；同内容只激活最新候选，其余重复候选直接淘汰。
-        if (activatedRec) {
-          rec.deleted = true
-          return
-        }
-        // 用新激活的复读替换当前复读
-        isNewRec = false
-        activatedRec = rec
-      })
-      if (activatedRec) {
-        runtime.queuedRecs = runtime.queuedRecs.filter(rec => rec !== activatedRec)
-        currentRec = runtime.currentRec = activatedRec
-        if (currentRec.senders.length > 1) await updateRepeatStats(currentRec)
-      }
-
-      // 激活候选会替换 currentRec，因此必须显式保存先前真正被打断的记录。
-      if (interruptedRepeatCount > 1) {
-        runtime.queuedRecs = runtime.queuedRecs.filter(rec => rec !== interruptedRec)
-        // 记录打断者和复读结束时间
-        interruptedRec.interrupter = uid
-        interruptedRec.endTime = Date.now()
-
-        // 先生成派生字段再创建记录，避免数据库驱动先序列化记录，导致 OCR
-        // 和分词结果随机丢失。
-        if (settings.enableOcr && tesseractWorker) await updateImageText(interruptedRec)
-        if (settings.enableSegmentation && jieba) await updateWords(interruptedRec)
-
-        const [ old ] = await Promise.all([
-          // 将运行时作为新复读记录写入复读记录表
-          ctx.database.create('w-repeat-record', omit(interruptedRec, [ 'unrelatedCount', 'deleted' ])),
-          // 更新打断者复读用户数据
-          ctx.database.upsert('w-repeat-user', row => [{
-            uid,
-            interruptTime: $inc(row.interruptTime)
-          }])
-        ])
-
-        // 如果允许挂起，挂起被打断的复读
-        if (settings.maxUnrelatedCount && old.senders.length > 1) {
-          runtime.suspendedRecs.unshift({
-            ...old,
-            unrelatedCount: 1,
-            suspendTime: Date.now(),
-            resumeTime: undefined
-          })
-        }
-      }
-
-      // 如果需要新建当前复读
-      if (isNewRec) {
-        // 新建当前复读，包含内容、图片、开始时间、第一个发送者的信息
-        runtime.currentRec = currentRec = {
-          ...createCurrentRec(gid),
-          content,
-          images,
-          startTime: session.timestamp,
-          senders: [ uid ],
-        }
-        updateRecQuote(session, currentRec)
-        // 滚动复读队列
-        runtime.queuedRecs.unshift(currentRec)
-      }
-    }
-
-    // 机器人复读
-    if (currentRec.senders.length === settings.repeatCount) {
-      return h('as-forward', { level: 'never' }, [
-        currentRec.quote?.valid ? h.quote(currentRec.quote.id) : '',
-        ...h.parse(unescapeMessage(currentRec))
-      ])
-    }
-
-    // 传向下一个中间件
-    return next()
+    return reply ?? next()
   }, config.isPrepend)
 
   // 复读指令
@@ -865,7 +862,7 @@ export async function apply(ctx: Context, config: Config) {
         'id', 'gid', 'content', 'senders', 'startTime', 'endTime', 'interrupter', 'images'
       ])
 
-      let recs = await ctx.database
+      const legacyRecs = await ctx.database
         .select('w-repeat-record')
         .where(row => $.query(row, {
           gid: isGlobal ? {} : gid,
@@ -900,6 +897,32 @@ export async function apply(ctx: Context, config: Config) {
         } satisfies Dict<Selection.Callback<RepeatRecord & { count: number }>>))
         .orderBy(sortMethod as any, sortDirection)
         .execute()
+
+      const v2Records = (await getV2Records(
+        isGlobal ? undefined : gid,
+        parseDuration(duration),
+      )).filter(record =>
+        (! options.filter || new RegExp(options.filter).test(record.content)) &&
+        (! options.starter || record.senders[0] === options.starter) &&
+        (! options.repeater || record.senders.includes(options.repeater)) &&
+        (! options.interrupter || record.interrupter === options.interrupter) &&
+        (! options.image || record.hasImage)
+      )
+      let recs = [
+        ...legacyRecs.map(record => ({
+          ...asUnifiedV1(record),
+          count: record.count,
+          tps: record.tps,
+        })),
+        ...v2Records.map(record => ({
+          ...record,
+          count: record.senders.length,
+          tps: record.senders.length / (record.endTime - record.startTime) * 1000,
+        })),
+      ].sort((a, b) => {
+        const difference = a[sortMethod] - b[sortMethod]
+        return sortDirection === 'asc' ? difference : - difference
+      })
 
       if (jsfilter) recs = recs.filter(eval(jsfilter))
 
@@ -1090,13 +1113,17 @@ export async function apply(ctx: Context, config: Config) {
 
       const starterDict: Record<string, { name: string, count: number }> = {}
       const sendMat: Record<string, Record<string, { count: number }>> = {}
-      const recs = await ctx.database
+      const legacyRecs = await ctx.database
         .select('w-repeat-record')
         .where({
           gid,
           ...parseDuration(options.duration)
         })
         .execute()
+      const recs = [
+        ...legacyRecs.map(asUnifiedV1),
+        ...await getV2Records(gid, parseDuration(options.duration)),
+      ]
       if (! recs.length) return '指定时间内还没有复读记录。'
 
       recs.forEach(rec => {
@@ -1204,11 +1231,18 @@ export async function apply(ctx: Context, config: Config) {
       const gid = options.guild ?? session.gid
 
       // TODO: optimize
-      const recs = await ctx.database
+      const legacyRecs = await ctx.database
         .select('w-repeat-record')
         .where({ gid })
         .project([ 'startTime' ])
         .execute()
+      const recs = [
+        ...legacyRecs,
+        ...await ctx.database.get('w-repeat-record-v2', {
+          platform: splitWithLimit(gid, ':', 2)[0],
+          guildId: splitWithLimit(gid, ':', 2)[1],
+        }),
+      ]
 
       const timeMat: Record<string, Record<string, number>> = Object.fromEntries(
         Array.from({ length: 24 }).map((_, i) => [
@@ -1321,10 +1355,16 @@ export async function apply(ctx: Context, config: Config) {
             const date = dayjs(`${month}-${day}`)
             const start = + date.startOf('day')
             const end = + date.endOf('day')
-            const recs = await ctx.database.get('w-repeat-record', {
+            const legacyRecs = await ctx.database.get('w-repeat-record', {
               gid,
               startTime: { $gte: start, $lte: end }
             })
+            const recs = [
+              ...legacyRecs.map(asUnifiedV1),
+              ...await getV2Records(gid, {
+                startTime: { $gte: start, $lte: end },
+              }),
+            ]
             if (! recs.length) return [
               { month, day, id: null, count: null },
               { gid, month, day }
@@ -1488,7 +1528,13 @@ export async function apply(ctx: Context, config: Config) {
     .option('ocr', '-o 识别图片中文字')
     .option('segmentation', '--seg 对复读消息分词')
     .action(async ({ session, options }, id) => {
-      const [ rec ] = await ctx.database.get('w-repeat-record', { id })
+      const [v2Record] = await ctx.database.get('w-repeat-record-v2', { id })
+      const [legacyRecord] = v2Record
+        ? []
+        : await ctx.database.get('w-repeat-record', { id })
+      const rec = v2Record
+        ? (await hydrateV2Records([v2Record]))[0]
+        : legacyRecord && asUnifiedV1(legacyRecord)
       if (! rec) return `未找到复读 #${id}。`
 
       const guildId = rec.gid.split(':')[1]
@@ -1498,18 +1544,25 @@ export async function apply(ctx: Context, config: Config) {
       let content: string
 
       if (options.delete) {
-        await ctx.database.remove('w-repeat-record', { id })
+        if (rec.storageVersion === 2) await removePersistedCandidate(id)
+        else await ctx.database.remove('w-repeat-record', { id })
         content = '[已删除]'
       }
       else {
         content = unescapeMessage(rec)
         if (options.ocr) {
+          if (rec.storageVersion === 2) return 'message-db 记录暂不支持写入 OCR 结果'
           if (tesseractWorker) await updateImageText(rec)
           else return 'Tesseract 未加载，无法识别图片中文字'
         }
         if (options.segmentation) {
+          if (rec.storageVersion === 2) {
+            rec.words = await ctx.messageDb.getWordsByMessageKeys([v2Record.starterMessageKey])
+          }
+          else {
           if (jieba) await updateWords(rec)
           else return 'Jieba 未加载，无法分词'
+          }
         }
       }
 
@@ -1564,20 +1617,20 @@ export async function apply(ctx: Context, config: Config) {
 
   ctx.command('repeat.debug.runtime', '获取当前复读运行时', { authority: 2 })
     .action(({ session }) => '当前运行时：\n'
-      + h.escape(JSON.stringify(runtimes[session.gid], null, 2))
+      + h.escape(JSON.stringify(trackerStates.get(session.gid), null, 2))
     )
 
   ctx.command('repeat.debug.runtime.clear', '清除复读运行时', { authority: 2 })
     .option('all', '-a 清除所有')
     .action(async ({ session: { gid }, options: { all } }) => {
-      const gids = all ? Object.keys(runtimes) : [gid]
-      gids.forEach(gid => delete runtimes[gid])
+      const gids = all ? [...trackerStates.keys()] : [gid]
+      gids.forEach(gid => trackerStates.delete(gid))
 
       return `清除了 ${gids.length} 个运行时`
     })
 
   ctx.command('repeat.debug.runtime.list', '获取复读运行时列表', { authority: 2 })
-    .action(() => '运行时列表：' + Object.keys(runtimes).join(', '))
+    .action(() => '运行时列表：' + [...trackerStates.keys()].join(', '))
 
   ctx.command('repeat.admin', '复读管理')
     .alias('repeat.a')
@@ -1641,7 +1694,10 @@ export async function apply(ctx: Context, config: Config) {
     .action(async ({ session }) => {
       await session.send('正在根据复读记录重建用户数据表……')
       await ctx.database.remove('w-repeat-user', {})
-      const recs = await ctx.database.get('w-repeat-record', {})
+      const recs = [
+        ...(await ctx.database.get('w-repeat-record', {})).map(asUnifiedV1),
+        ...await getV2Records(),
+      ]
       const users: Record<string, RepeatUser> = {}
       const getUser = (uid: string): RepeatUser => users[uid] ??= {
         uid,
@@ -1691,14 +1747,17 @@ export async function apply(ctx: Context, config: Config) {
       await session.send('正在清空分词表……')
       await ctx.database.remove('w-repeat-word', {})
       await session.send('开始查询数据库…… ')
-      const recs = await ctx.database.get('w-repeat-record', {})
-      await session.send(`正在对 ${recs.length} 条复读记录分词……`)
+      const legacyRecs = await ctx.database.get('w-repeat-record', {})
+      const v2Recs = await getV2Records()
+      await session.send(`正在对 ${legacyRecs.length + v2Recs.length} 条复读记录分词……`)
       const wordDict: Record<string, number> = {}
       const incWord = safeInc(wordDict)
-      await Promise.all(recs.map(async rec => {
+      await Promise.all(legacyRecs.map(async rec => {
         const words = await updateWords(rec)
         words.forEach(({ tag, word }) => incWord(`${rec.gid}#${tag}#${word}`))
       }))
+      v2Recs.forEach(rec => rec.words?.forEach(({ tag, word }) =>
+        incWord(`${rec.gid}#${tag}#${word}`)))
       await session.send('正在写入分词表……')
       const words = Object.entries(wordDict).map(([ gidTagWord, count ]) => {
         const [ gid, tag, word ] = splitWithLimit(gidTagWord, '#', 3)
@@ -1709,8 +1768,19 @@ export async function apply(ctx: Context, config: Config) {
 
   ctx.command('repeat.admin.migrate-guild <from:channel> <to:channel>', '迁移群复读记录', { authority: 4 })
     .action(async (_, from, to) => {
-      const res = await ctx.database.set('w-repeat-record', { gid: from }, { gid: to })
-      return `成功从 ${from} 迁移了 ${res.modified} 条复读记录到 ${to}。`
+      const [fromPlatform, fromGuildId] = splitWithLimit(from, ':', 2)
+      const [toPlatform, toGuildId] = splitWithLimit(to, ':', 2)
+      const [legacy, v2] = await Promise.all([
+        ctx.database.set('w-repeat-record', { gid: from }, { gid: to }),
+        ctx.database.set('w-repeat-record-v2', {
+          platform: fromPlatform,
+          guildId: fromGuildId,
+        }, {
+          platform: toPlatform,
+          guildId: toGuildId,
+        }),
+      ])
+      return `成功从 ${from} 迁移了 ${legacy.modified + v2.modified} 条复读记录到 ${to}。`
     })
 
   // 回收副作用
