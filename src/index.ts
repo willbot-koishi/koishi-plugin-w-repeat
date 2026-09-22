@@ -66,7 +66,7 @@ export const RepeatSettings: z<RepeatSettings> = z.object({
   doProceedImage: z.boolean().default(false).description('旧版图片处理开关（新记录由 message-db 转存资源）'),
   enableOcr: z.boolean().default(true).description('是否为旧版复读记录生成 OCR 结果'),
 
-  enableSegmentation: z.boolean().default(true).description('是否为旧版复读记录分词（新记录使用 message-db 分词）'),
+  enableSegmentation: z.boolean().default(true).description('是否更新复读词频（旧记录本地分词，新记录使用 message-db 分词）'),
   segmentationWordBlacklist: z.array(z.string()).description('复读词频统计中不显示的词'),
   segmentationTagBlacklist: z.array(z.string()).description('复读词频统计中不显示的词性'),
 })
@@ -781,6 +781,25 @@ export async function apply(ctx: Context, config: Config) {
     ])
   }
 
+  const updateV2WordStats = async (candidate: RepeatCandidate) => {
+    const words = await ctx.messageDb.ensureMessageWords([candidate.messages[0].key])
+    const counts = new Map<string, { word: string, tag: string, count: number }>()
+    for (const { word, tag } of words) {
+      const key = JSON.stringify([word, tag])
+      const item = counts.get(key) ?? { word, tag, count: 0 }
+      item.count ++
+      counts.set(key, item)
+    }
+    if (! counts.size) return
+    const gid = `${candidate.messages[0].platform}:${candidate.messages[0].guildId}`
+    await ctx.database.upsert('w-repeat-word', row => [...counts.values()].map(item => ({
+      gid,
+      word: item.word,
+      tag: item.tag,
+      count: $.add(row.count, item.count),
+    })))
+  }
+
   ctx.middleware(async (session, next) => {
     if (! session.guildId) return next()
     const { content: originalContent, gid, uid } = session
@@ -823,7 +842,18 @@ export async function apply(ctx: Context, config: Config) {
       }
       if (transition.stats) await updateV2RepeatStats(transition.stats, uid)
       if (transition.completed) {
+        const isNewRecord = transition.completed.persistedId === undefined
         const id = await persistCandidate(transition.completed)
+        if (isNewRecord && settings.enableSegmentation) {
+          try {
+            await updateV2WordStats(transition.completed)
+          }
+          catch (error) {
+            // Word counts are a rebuildable cache and must not roll back a
+            // successfully persisted repeat record.
+            ctx.logger.warn('failed to update repeat word cache: %o', error)
+          }
+        }
         await ctx.database.upsert('w-repeat-user', row => [{
           uid,
           interruptTime: $inc(row.interruptTime),
@@ -1868,7 +1898,13 @@ export async function apply(ctx: Context, config: Config) {
       await ctx.database.remove('w-repeat-word', {})
       await session.send('开始查询数据库…… ')
       const legacyRecs = await filterUnmigratedLegacy(await ctx.database.get('w-repeat-record', {}))
-      const v2Recs = await getV2Records()
+      const v2Rows = await ctx.database.get('w-repeat-record-v2', {})
+      for (let index = 0; index < v2Rows.length; index += 500) {
+        await ctx.messageDb.ensureMessageWords(
+          v2Rows.slice(index, index + 500).map(record => record.starterMessageKey),
+        )
+      }
+      const v2Recs = await hydrateV2Records(v2Rows)
       await session.send(`正在对 ${legacyRecs.length + v2Recs.length} 条复读记录分词……`)
       const wordDict: Record<string, number> = {}
       const incWord = safeInc(wordDict)

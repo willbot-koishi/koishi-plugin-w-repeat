@@ -49,6 +49,18 @@ class MessageDbMock extends Service {
   }
 
   async getWordsByMessageKeys() { return [] }
+  async ensureMessageWords(keys: readonly string[]) {
+    return keys.map(messageKey => ({
+      messageKey,
+      platform: 'mock',
+      guildId: 'group',
+      userId: 'starter',
+      timestamp: 0,
+      index: 0,
+      word: 'cached',
+      tag: 'x',
+    }))
+  }
   async retainMessages(owner: string, keys: readonly string[]) {
     this.references.set(owner, new Set(keys))
   }
@@ -203,7 +215,7 @@ describe('repeat tracking', () => {
   })
 
   it('reads and deletes message-backed records through commands', async () => {
-    const ctx = await createContext()
+    const ctx = await createContext({ enableSegmentation: true })
     const starter = ctx.mock.client('starter', 'group')
     const repeater = ctx.mock.client('repeater', 'group')
     const interrupter = ctx.mock.client('interrupter', 'group')
@@ -219,6 +231,11 @@ describe('repeat tracking', () => {
     const [record] = await ctx.database.get('w-repeat-record-v2', {})
     const service = ctx.messageDb as unknown as MessageDbMock
     assert.equal(service.references.has(`w-repeat:${record.id}`), true)
+    assert.deepEqual(await ctx.database.get('w-repeat-word', {
+      gid: 'mock:group',
+      word: 'cached',
+      tag: 'x',
+    }), [{ gid: 'mock:group', word: 'cached', tag: 'x', count: 1 }])
 
     await ctx.database.upsert('w-repeat-record', [{
       id: record.id,
