@@ -95,13 +95,12 @@ export function transitionRepeat(
   let current = state.current
   const isRepeating = isSameMessage(message, current)
   let resumedRecordId: number | undefined
-  let didResume = false
+  let resumed: RepeatCandidate | undefined
 
   for (const candidate of state.suspended) {
     if (isSameMessage(message, candidate)) {
       appendMessage(candidate, message)
-      if (isRepeating && ! didResume) {
-        const resumeCandidate = current
+      if (! resumed) {
         const pending = candidate.pendingSuspension
         if (pending) {
           candidate.suspensions.push({
@@ -112,27 +111,32 @@ export function transitionRepeat(
         }
         resumedRecordId = candidate.persistedId
         delete candidate.pendingSuspension
-        state.queued = state.queued.filter(item => item !== resumeCandidate)
-        current = state.current = candidate
-        didResume = true
+        resumed = candidate
       }
+      else candidate.unrelatedCount = Number.POSITIVE_INFINITY
     }
     else if (++ candidate.unrelatedCount > options.maxUnrelatedCount) {
       candidate.unrelatedCount = Number.POSITIVE_INFINITY
     }
   }
   state.suspended = state.suspended.filter(candidate =>
-    candidate.unrelatedCount !== Number.POSITIVE_INFINITY && candidate !== current)
+    candidate.unrelatedCount !== Number.POSITIVE_INFINITY && candidate !== resumed)
 
   let completed: RepeatCandidate | undefined
   let stats: RepeatCandidate | undefined
   if (isRepeating) {
-    if (! didResume) appendMessage(current, message)
+    if (resumed) {
+      // Drop the short-lived mirror started while the persisted repeat was
+      // suspended. The incoming message already belongs to the resumed record.
+      state.queued = state.queued.filter(candidate => candidate !== current)
+      current = state.current = resumed
+    }
+    else appendMessage(current, message)
     if (current.messages.length > 1) stats = current
   }
   else {
     const interrupted = current
-    let activated: RepeatCandidate | undefined
+    let activated = resumed
 
     for (const candidate of state.queued) {
       if (isSameMessage(message, candidate)) {

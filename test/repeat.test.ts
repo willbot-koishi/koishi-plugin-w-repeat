@@ -124,6 +124,18 @@ async function getRecordSenders(ctx: Context, recordId: number) {
 }
 
 describe('repeat tracking', () => {
+  it('repeats an AABA message sequence', async () => {
+    const ctx = await createContext({ maxUnrelatedCount: 5, repeatCount: 3 })
+    await ctx.mock.client('u1', 'group').receive('A', 0)
+    await ctx.mock.client('u2', 'group').receive('A', 0)
+    await ctx.mock.client('u3', 'group').receive('B', 0)
+
+    const replies = await ctx.mock.client('u4', 'group').receive('A', 1)
+
+    assert.equal(replies.length, 1)
+    assert.match(replies[0], /A/)
+  })
+
   it('increments repeatCount independently from repeatTime', async () => {
     const ctx = await createContext()
     const starter = ctx.mock.client('starter', 'group')
@@ -140,7 +152,7 @@ describe('repeat tracking', () => {
     assert.equal(user.repeatCount, 3)
   })
 
-  it('does not persist a stale queued mirror after an interrupted repeat', async () => {
+  it('does not persist a duplicate mirror after an interrupted repeat resumes', async () => {
     const ctx = await createContext({ maxUnrelatedCount: 5 })
     for (const [ uid, content ] of [
       [ 'u1', 'A' ],
@@ -154,7 +166,9 @@ describe('repeat tracking', () => {
 
     const records = await getRecords(ctx, 'A')
     assert.equal(records.length, 1)
-    assert.deepEqual(await getRecordSenders(ctx, records[0].id), [ 'mock:u1', 'mock:u2' ])
+    assert.deepEqual(await getRecordSenders(ctx, records[0].id), [
+      'mock:u1', 'mock:u2', 'mock:u4',
+    ])
   })
 
   it('merges a suspended repeat after the content repeats again', async () => {

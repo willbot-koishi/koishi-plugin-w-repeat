@@ -37,27 +37,46 @@ describe('repeat tracker', () => {
     ])
   })
 
-  it('resumes a persisted repeat after two matching messages', () => {
+  it('resumes a persisted repeat on the first matching message', () => {
     const state = createRepeatTrackerState()
     transitionRepeat(state, message(1, 'A'), options)
     transitionRepeat(state, message(2, 'A'), options)
     const interrupted = transitionRepeat(state, message(3, 'B'), options).completed
     suspendPersistedCandidate(state, interrupted, 10)
 
-    transitionRepeat(state, message(4, 'A'), options)
-    const result = transitionRepeat(state, message(5, 'A'), options)
+    const result = transitionRepeat(state, message(4, 'A'), options)
 
     assert.equal(result.resumedRecordId, 10)
     assert.equal(result.current.persistedId, 10)
     assert.deepEqual(result.current.messages.map(item => item.key), [
-      'message-1', 'message-2', 'message-4', 'message-5',
+      'message-1', 'message-2', 'message-4',
     ])
     assert.deepEqual(result.current.suspensions, [{
       suspendMessageKey: 'message-3',
       suspendTime: 3,
-      resumeMessageKey: 'message-5',
-      resumeTime: 5,
+      resumeMessageKey: 'message-4',
+      resumeTime: 4,
     }])
+    assert.equal(result.shouldRepeat, true)
+  })
+
+  it('completes the current repeat while resuming a suspended one', () => {
+    const state = createRepeatTrackerState()
+    transitionRepeat(state, message(1, 'A'), options)
+    transitionRepeat(state, message(2, 'A'), options)
+    const interrupted = transitionRepeat(state, message(3, 'B'), options).completed
+    suspendPersistedCandidate(state, interrupted, 10)
+    transitionRepeat(state, message(4, 'B'), options)
+
+    const result = transitionRepeat(state, message(5, 'A'), options)
+
+    assert.equal(result.resumedRecordId, 10)
+    assert.deepEqual(result.current.messages.map(item => item.key), [
+      'message-1', 'message-2', 'message-5',
+    ])
+    assert.deepEqual(result.completed?.messages.map(item => item.key), [
+      'message-3', 'message-4',
+    ])
   })
 
   it('only requests a bot repeat at the configured count', () => {
