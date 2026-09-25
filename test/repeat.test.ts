@@ -214,7 +214,7 @@ describe('repeat tracking', () => {
     assert.equal(repeater.repeatTime, 1)
   })
 
-  it('reads and deletes message-backed records through commands', async () => {
+  it('reads and deletes message-backed records without falling back to legacy rows', async () => {
     const ctx = await createContext({ enableSegmentation: true })
     const starter = ctx.mock.client('starter', 'group')
     const repeater = ctx.mock.client('repeater', 'group')
@@ -269,7 +269,7 @@ describe('repeat tracking', () => {
     assert.match(deleted, /\[已删除\]/)
     assert.deepEqual(await ctx.database.get('w-repeat-record-v2', { id: record.id }), [])
     assert.deepEqual(await ctx.database.get('w-repeat-message-v2', { recordId: record.id }), [])
-    assert.deepEqual(await ctx.database.get('w-repeat-record', { id: record.id }), [])
+    assert.equal((await ctx.database.get('w-repeat-record', { id: record.id })).length, 1)
     assert.equal(service.references.has(`w-repeat:${record.id}`), false)
   })
 })

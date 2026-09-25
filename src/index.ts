@@ -1,10 +1,8 @@
 import {
   h, z,
   Argv, Context, Session, SessionError,
-  $, Direction, Row, Query,
+  $, Direction, Query,
   Fragment,
-  Dict,
-  Selection,
   Awaitable,
   Update,
   type Tables,
@@ -409,11 +407,6 @@ export async function apply(ctx: Context, config: Config) {
     return days
   }
 
-  const removeUndefined = <const T>(x: T): T => {
-    for (const k in x) if (x[k] === undefined) delete x[k]
-    return x
-  }
-
   // Adapter
   const getMemberDict = async (session: Session, guildId: string) => {
     const { data: memberList } = await session.bot.getGuildMemberList(guildId)
@@ -442,11 +435,6 @@ export async function apply(ctx: Context, config: Config) {
       : time.toFixed(3) + 'ms'
     }`
   }
-
-  // Database
-  const getReserveProjection = <S>(fields: (keyof S)[]): {
-    [K in keyof S]: (row: Row<S>) => Row<S>[K]
-  } => Object.fromEntries(fields.map(name => [ name, (row: Row<S>) => row[name] ])) as any
 
   const parseDuration = (duration: string): Query<RepeatRecord> & object => {
     if (duration === 'all') return {}
@@ -927,47 +915,6 @@ export async function apply(ctx: Context, config: Config) {
         'filter', 'image', 'starter', 'repeater', 'interrupter'
       ] satisfies (keyof typeof options)[]).some(name => name in options))
 
-      // TODO: wait for row destruction
-      const reserveProjection = getReserveProjection<RepeatRecord>([
-        'id', 'gid', 'content', 'senders', 'startTime', 'endTime', 'interrupter', 'images'
-      ])
-
-      const legacyRecs = await filterUnmigratedLegacy(await ctx.database
-        .select('w-repeat-record')
-        .where(row => $.query(row, {
-          gid: isGlobal ? {} : gid,
-          ...parseDuration(duration)
-        }, $.and(
-          options.filter
-            ? $.regex(row.content, options.filter)
-            : true,
-          options.starter
-            ? $.eq($.get(row.senders, 0), options.starter)
-            : true,
-          options.repeater
-            ? $.in(options.repeater, row.senders)
-            : true,
-          options.interrupter
-            ? $.eq(row.interrupter, options.interrupter)
-            : true,
-          options.image
-            ? $.gt($.length(row.images), 0)
-            : true
-        )))
-        .project({
-          ...reserveProjection,
-          count: row => $.length(row.senders)
-        })
-        .project(removeUndefined({
-          ...reserveProjection,
-          count: row => row.count,
-          tps: sortMethod === 'tps'
-            ? row => $.mul($.div(row.count, $.sub(row.endTime, row.startTime)), 1000)
-            : undefined
-        } satisfies Dict<Selection.Callback<RepeatRecord & { count: number }>>))
-        .orderBy(sortMethod as any, sortDirection)
-        .execute())
-
       const v2Records = (await getV2Records(
         isGlobal ? undefined : gid,
         parseDuration(duration),
@@ -979,11 +926,6 @@ export async function apply(ctx: Context, config: Config) {
         (! options.image || record.hasImage)
       )
       let recs = [
-        ...legacyRecs.map(record => ({
-          ...asUnifiedV1(record),
-          count: record.count,
-          tps: record.tps,
-        })),
         ...v2Records.map(record => ({
           ...record,
           count: record.senders.length,
@@ -1183,17 +1125,7 @@ export async function apply(ctx: Context, config: Config) {
 
       const starterDict: Record<string, { name: string, count: number }> = {}
       const sendMat: Record<string, Record<string, { count: number }>> = {}
-      const legacyRecs = await filterUnmigratedLegacy(await ctx.database
-        .select('w-repeat-record')
-        .where({
-          gid,
-          ...parseDuration(options.duration)
-        })
-        .execute())
-      const recs = [
-        ...legacyRecs.map(asUnifiedV1),
-        ...await getV2Records(gid, parseDuration(options.duration)),
-      ]
+      const recs = await getV2Records(gid, parseDuration(options.duration))
       if (! recs.length) return '指定时间内还没有复读记录。'
 
       recs.forEach(rec => {
@@ -1301,18 +1233,10 @@ export async function apply(ctx: Context, config: Config) {
       const gid = options.guild ?? session.gid
 
       // TODO: optimize
-      const legacyRecs = await filterUnmigratedLegacy(await ctx.database
-        .select('w-repeat-record')
-        .where({ gid })
-        .project([ 'id', 'startTime' ])
-        .execute())
-      const recs = [
-        ...legacyRecs,
-        ...await ctx.database.get('w-repeat-record-v2', {
-          platform: splitWithLimit(gid, ':', 2)[0],
-          guildId: splitWithLimit(gid, ':', 2)[1],
-        }),
-      ]
+      const recs = await ctx.database.get('w-repeat-record-v2', {
+        platform: splitWithLimit(gid, ':', 2)[0],
+        guildId: splitWithLimit(gid, ':', 2)[1],
+      })
 
       const timeMat: Record<string, Record<string, number>> = Object.fromEntries(
         Array.from({ length: 24 }).map((_, i) => [
@@ -1425,16 +1349,9 @@ export async function apply(ctx: Context, config: Config) {
             const date = dayjs(`${month}-${day}`)
             const start = + date.startOf('day')
             const end = + date.endOf('day')
-            const legacyRecs = await filterUnmigratedLegacy(await ctx.database.get('w-repeat-record', {
-              gid,
-              startTime: { $gte: start, $lte: end }
-            }))
-            const recs = [
-              ...legacyRecs.map(asUnifiedV1),
-              ...await getV2Records(gid, {
-                startTime: { $gte: start, $lte: end },
-              }),
-            ]
+            const recs = await getV2Records(gid, {
+              startTime: { $gte: start, $lte: end },
+            })
             if (! recs.length) return [
               { month, day, id: null, count: null },
               { gid, month, day }
@@ -1599,12 +1516,7 @@ export async function apply(ctx: Context, config: Config) {
     .option('segmentation', '--seg 对复读消息分词')
     .action(async ({ session, options }, id) => {
       const [v2Record] = await ctx.database.get('w-repeat-record-v2', { id })
-      const [legacyRecord] = v2Record
-        ? []
-        : await filterUnmigratedLegacy(await ctx.database.get('w-repeat-record', { id }))
-      const rec = v2Record
-        ? (await hydrateV2Records([v2Record]))[0]
-        : legacyRecord && asUnifiedV1(legacyRecord)
+      const rec = v2Record && (await hydrateV2Records([v2Record]))[0]
       if (! rec) return `未找到复读 #${id}。`
 
       const guildId = rec.gid.split(':')[1]
@@ -1616,11 +1528,7 @@ export async function apply(ctx: Context, config: Config) {
       if (options.delete) {
         if (rec.storageVersion === 2) {
           await removePersistedCandidate(id)
-          // A migrated v2 row may still have its read-only v1 source. Deleting a
-          // visible record must not allow that source to reappear on direct lookup.
-          await ctx.database.remove('w-repeat-record', { id })
         }
-        else await ctx.database.remove('w-repeat-record', { id })
         content = '[已删除]'
       }
       else {
